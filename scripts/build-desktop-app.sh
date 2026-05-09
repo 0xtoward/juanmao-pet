@@ -10,6 +10,7 @@ JUANMAO_ROOM="${JUANMAO_ROOM:-}"
 JUANMAO_PET_NAME="${JUANMAO_PET_NAME:-卷毛}"
 JUANMAO_PET_KIND="${JUANMAO_PET_KIND:-cockapoo}"
 JUANMAO_ACTOR_NAME="${JUANMAO_ACTOR_NAME:-$JUANMAO_PET_NAME}"
+MACOS_DEPLOYMENT_TARGET="${MACOS_DEPLOYMENT_TARGET:-12.0}"
 APP="$ROOT/$APP_NAME.app"
 CONTENTS="$APP/Contents"
 MACOS="$CONTENTS/MacOS"
@@ -21,7 +22,8 @@ if [ "$APP_NAME" = "卷毛 Desktop" ]; then
 fi
 mkdir -p "$MACOS" "$RESOURCES/assets"
 
-swiftc "$ROOT/macos/CocoInteractive.swift" \
+MACOSX_DEPLOYMENT_TARGET="$MACOS_DEPLOYMENT_TARGET" swiftc "$ROOT/macos/CocoInteractive.swift" \
+  -target "arm64-apple-macosx$MACOS_DEPLOYMENT_TARGET" \
   -framework Cocoa \
   -framework QuartzCore \
   -o "$MACOS/CocoInteractive"
@@ -29,6 +31,7 @@ swiftc "$ROOT/macos/CocoInteractive.swift" \
 cp "$ROOT/macos/Info.plist" "$CONTENTS/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleName $BUNDLE_DISPLAY_NAME" "$CONTENTS/Info.plist" >/dev/null
 /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $BUNDLE_ID" "$CONTENTS/Info.plist" >/dev/null
+/usr/libexec/PlistBuddy -c "Set :LSMinimumSystemVersion $MACOS_DEPLOYMENT_TARGET" "$CONTENTS/Info.plist" >/dev/null
 cp "$ROOT/desktop.html" "$RESOURCES/desktop.html"
 cp "$ROOT/desktop.css" "$RESOURCES/desktop.css"
 cp "$ROOT/desktop.js" "$RESOURCES/desktop.js"
@@ -61,7 +64,12 @@ elif [ -f "$ROOT/assets/dachshund-spritesheet.webp" ]; then
 fi
 
 if command -v codesign >/dev/null 2>&1; then
-  codesign --force --deep --sign - "$APP" >/dev/null 2>&1 || true
+  xattr -cr "$APP" 2>/dev/null || true
+  xattr -c "$APP" 2>/dev/null || true
+  xattr -d com.apple.FinderInfo "$APP" 2>/dev/null || true
+  xattr -d 'com.apple.fileprovider.fpfs#P' "$APP" 2>/dev/null || true
+  codesign --remove-signature "$APP" >/dev/null 2>&1 || true
+  codesign --force --deep --sign - "$APP" >/dev/null
 fi
 
 echo "$APP"

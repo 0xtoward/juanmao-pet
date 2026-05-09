@@ -79,11 +79,25 @@ struct OnlineConfig {
 
     static func from(input: String, current: OnlineConfig) -> OnlineConfig? {
         let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
+        guard !trimmed.isEmpty else { return current }
 
-        var serverURL = trimmed
+        let pattern = #"https?://[^\s]+"#
+        let regex = try? NSRegularExpression(pattern: pattern)
+        let range = NSRange(trimmed.startIndex..<trimmed.endIndex, in: trimmed)
+        let detectedURL = regex?.firstMatch(in: trimmed, range: range).flatMap { match -> String? in
+            guard let matchRange = Range(match.range, in: trimmed) else { return nil }
+            return String(trimmed[matchRange])
+        }
+
+        var serverURL = detectedURL ?? trimmed
         var room = current.room
-        if let components = URLComponents(string: trimmed),
+        if URLComponents(string: serverURL)?.scheme == nil,
+           !serverURL.contains(" "),
+           serverURL.contains(".") {
+            serverURL = "https://\(serverURL)"
+        }
+
+        if let components = URLComponents(string: serverURL),
            let scheme = components.scheme,
            let host = components.host {
             let port = components.port.map { ":\($0)" } ?? ""
@@ -95,7 +109,6 @@ struct OnlineConfig {
         }
 
         let normalized = normalizeServerURL(serverURL)
-        guard URLComponents(string: normalized)?.scheme != nil else { return nil }
 
         return OnlineConfig(
             serverURL: normalized,
@@ -124,6 +137,17 @@ struct OnlineConfig {
         guard let host = URLComponents(string: value)?.host?.lowercased() else { return false }
         return host == "trycloudflare.com" || host.hasSuffix(".trycloudflare.com")
     }
+}
+
+struct PetHistoryEntry: Codable {
+    let id: Int
+    let at: TimeInterval
+    let action: String
+    let actor: String
+    let petName: String
+    let petKind: String
+    let text: String
+    let incoming: Bool
 }
 
 final class CocoPetView: NSView {
@@ -166,6 +190,7 @@ final class CocoPetView: NSView {
     private var tongueStartedAt: Date?
     private var heartsStartedAt: Date?
     private var guestStartedAt: Date?
+    private var stickySpeechEventID: Int?
     private var hovering = false
     private var controlsRevealUntil: Date?
     private var pressedAction: String?
@@ -187,6 +212,7 @@ final class CocoPetView: NSView {
     private var lastReadableEventLabel: String?
     private var unreadEvents: [Int: String] = [:]
     private var sentEventLabels: [Int: String] = [:]
+    private let feedOptions = ["小饼干", "水", "肉干"]
 
     private var love: Int
     private var fullness: Int
@@ -283,7 +309,7 @@ final class CocoPetView: NSView {
         }
 
         if event.clickCount >= 2 {
-            perform("feed")
+            showFeedPicker()
             handledMouseDownAction = true
             return
         }
@@ -350,13 +376,14 @@ final class CocoPetView: NSView {
         menu.addItem(.separator())
         addMenuItem("发送文字...", #selector(menuSendText), to: menu)
         addMenuItem("已读全部", #selector(menuMarkRead), to: menu)
+        addMenuItem("浏览对话历史", #selector(menuHistory), to: menu)
         menu.addItem(.separator())
         addMenuItem("放大狗狗", #selector(menuScaleUp), to: menu)
         addMenuItem("缩小狗狗", #selector(menuScaleDown), to: menu)
         menu.addItem(.separator())
         addMenuItem("设置联机网址...", #selector(menuConnectionSettings), to: menu)
         menu.addItem(.separator())
-        addMenuItem("关闭 卷毛", #selector(menuClose), to: menu)
+        addMenuItem("关闭 \(onlineConfig.petName)", #selector(menuClose), to: menu)
         NSMenu.popUpContextMenu(menu, with: event, for: self)
     }
 
@@ -387,7 +414,7 @@ final class CocoPetView: NSView {
         let targetX = bounds.width * 0.34 - width / 2
         let elapsed = Date().timeIntervalSince(guestStartedAt ?? Date())
         let enterProgress = min(1, max(0, CGFloat(elapsed / 0.9)))
-        let leaveProgress = min(1, max(0, CGFloat((elapsed - 6.0) / 0.8)))
+        let leaveProgress = min(1, max(0, CGFloat((elapsed - 19.0) / 1.0)))
         let easedEnter = 1 - pow(1 - enterProgress, 3)
         let easedLeave = leaveProgress * leaveProgress
         let startX = -width - 16
@@ -960,12 +987,16 @@ final class CocoPetView: NSView {
         needsDisplay = true
     }
 
-    private func say(_ text: String) {
+    private func say(_ text: String, sticky: Bool = false, eventID: Int? = nil) {
         speech = text
         speechTimer?.invalidate()
-        speechTimer = Timer.scheduledTimer(withTimeInterval: 2.4, repeats: false) { [weak self] _ in
-            self?.speech = nil
-            self?.needsDisplay = true
+        stickySpeechEventID = sticky ? eventID : nil
+        if !sticky {
+            speechTimer = Timer.scheduledTimer(withTimeInterval: 2.4, repeats: false) { [weak self] _ in
+                self?.speech = nil
+                self?.stickySpeechEventID = nil
+                self?.needsDisplay = true
+            }
         }
         needsDisplay = true
     }
@@ -981,6 +1012,11 @@ final class CocoPetView: NSView {
     }
 
     private func perform(_ action: String, broadcast: Bool = true) {
+        if action == "feed", broadcast {
+            showFeedPicker()
+            return
+        }
+
         if broadcast, action != "close" {
             broadcastOnlineAction(action)
         }
@@ -999,7 +1035,7 @@ final class CocoPetView: NSView {
     }
 
     private func pat() {
-        say(["好舒服。", "再摸一下。", "卷毛开心。"].randomElement() ?? "好舒服。")
+        say(["好舒服。", "再摸一下。", "\(onlineConfig.petName)开心。"].randomElement() ?? "好舒服。")
         nudge(love: 8, energy: 1)
         showTongue()
         setAnimation("wave", duration: 1.35)
@@ -1009,6 +1045,15 @@ final class CocoPetView: NSView {
         say(["吃到啦。", "小碗清空。", "能量补满。"].randomElement() ?? "吃到啦。")
         nudge(love: 4, fullness: 16, energy: 2)
         setAnimation("jump", duration: 1.0)
+    }
+
+    private func sendFeed(food: String) {
+        let clipped = String(food.trimmingCharacters(in: .whitespacesAndNewlines).prefix(24))
+        guard !clipped.isEmpty else { return }
+        say("去给对方送\(clipped)。")
+        showHearts()
+        setAnimation("runRight", duration: 2.2)
+        broadcastOnlineAction("feed", text: clipped)
     }
 
     private func nap() {
@@ -1110,28 +1155,27 @@ final class CocoPetView: NSView {
         needsDisplay = true
     }
 
-    private func showGuestVisit(actor: String, petName: String, petKind: String) {
+    private func showGuestVisit(actor: String, petName: String, petKind: String, speech: String? = nil) {
         guestName = petName
         guestKind = petKind
-        guestSpeech = "\(petName)来串门"
+        guestSpeech = speech ?? "\(petName)来串门"
         guestStartedAt = Date()
         guestAnimation = "runRight"
         guestFrameIndex = 0
         guestLastFrameDate = Date()
         guestVisible = true
-        say("\(petName)来了。")
 
         guestWaveTimer?.invalidate()
         guestWaveTimer = Timer.scheduledTimer(withTimeInterval: 1.05, repeats: false) { [weak self] _ in
             self?.guestAnimation = "wave"
             self?.guestFrameIndex = 0
             self?.guestLastFrameDate = Date()
-            self?.guestSpeech = "嗨，\(self?.onlineConfig.petName ?? "卷毛")"
+            self?.guestSpeech = speech ?? "嗨，\(self?.onlineConfig.petName ?? "桌宠")"
             self?.needsDisplay = true
         }
 
         guestTimer?.invalidate()
-        guestTimer = Timer.scheduledTimer(withTimeInterval: 6.9, repeats: false) { [weak self] _ in
+        guestTimer = Timer.scheduledTimer(withTimeInterval: 20.0, repeats: false) { [weak self] _ in
             self?.guestVisible = false
             self?.guestName = nil
             self?.guestKind = nil
@@ -1208,43 +1252,58 @@ final class CocoPetView: NSView {
 
     private func performRemoteOnlineAction(_ action: String, event: [String: Any]) {
         let actor = (event["actor"] as? String) ?? "好友"
+        let text = ((event["text"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        var eventID: Int?
         if let id = event["id"] as? Int {
+            eventID = id
             lastReadableEventID = id
             lastReadableEventLabel = eventLabel(action: action, event: event)
             unreadEvents[id] = lastReadableEventLabel
         }
+        recordHistory(event: event, incoming: true)
 
         switch action {
         case "pat":
-            say("\(actor)摸了摸\(onlineConfig.petName)。")
+            say("\(actor)摸了摸\(onlineConfig.petName)。", sticky: true, eventID: eventID)
             nudge(love: 8, energy: 1)
             showTongue()
             setAnimation("wave", duration: 1.35)
         case "feed":
-            say("\(actor)投喂了\(onlineConfig.petName)。")
+            let petName = (event["petName"] as? String) ?? "\(actor)的小狗"
+            let petKind = (event["petKind"] as? String) ?? "cockapoo"
+            let food = text.isEmpty ? "小饼干" : text
+            showGuestVisit(actor: actor, petName: petName, petKind: petKind, speech: "送来\(food)")
+            say("\(petName)来投喂：\(food)", sticky: true, eventID: eventID)
             nudge(love: 4, fullness: 16, energy: 2)
-            setAnimation("jump", duration: 1.0)
+            showHearts()
+            setAnimation("jump", duration: 1.2)
         case "walk":
-            walk()
+            say("\(actor)带\(onlineConfig.petName)去散步。", sticky: true, eventID: eventID)
+            nudge(love: 5, fullness: -5, energy: -9)
+            setAnimation("runRight", duration: 2.2)
         case "miss":
-            say("我也想你")
+            say("\(actor)说想你。", sticky: true, eventID: eventID)
             nudge(love: 10, energy: 1)
             showHearts()
             setAnimation("wave", duration: 1.8)
         case "nap":
-            say("\(actor)让\(onlineConfig.petName)睡觉。")
+            say("\(actor)让\(onlineConfig.petName)睡觉。", sticky: true, eventID: eventID)
             nudge(fullness: -2, energy: 12)
             setAnimation("sleep")
         case "visit":
             let petName = (event["petName"] as? String) ?? "\(actor)的小狗"
             let petKind = (event["petKind"] as? String) ?? "cockapoo"
             showGuestVisit(actor: actor, petName: petName, petKind: petKind)
+            say("\(petName)来串门。", sticky: true, eventID: eventID)
+            if let eventID {
+                markRead(eventID: eventID, announce: false)
+            }
         case "remind":
             showHearts()
-            walk(message: "\(actor)提醒：喝水走走。")
+            say(text.isEmpty ? "\(actor)提醒：喝水，起来走走。" : "\(actor)：\(text)", sticky: true, eventID: eventID)
+            setAnimation("wave", duration: 1.2)
         case "message":
-            let text = ((event["text"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-            say(text.isEmpty ? "\(actor)发来一句话。" : "\(actor)：\(text)")
+            say(text.isEmpty ? "\(actor)发来一句话。" : "\(actor)：\(text)", sticky: true, eventID: eventID)
             showHearts()
             setAnimation("wave", duration: 1.2)
         default:
@@ -1253,9 +1312,13 @@ final class CocoPetView: NSView {
     }
 
     private func eventLabel(action: String, event: [String: Any] = [:]) -> String {
-        if action == "message" {
-            let text = ((event["text"] as? String) ?? "文字").trimmingCharacters(in: .whitespacesAndNewlines)
-            return text.isEmpty ? "文字" : text
+        if action == "message" || action == "remind" || action == "feed" {
+            let fallbackText = action == "message" ? "文字" : ""
+            let text = ((event["text"] as? String) ?? fallbackText).trimmingCharacters(in: .whitespacesAndNewlines)
+            if action == "feed" {
+                return text.isEmpty ? "投喂" : "投喂\(text)"
+            }
+            return text.isEmpty ? (action == "remind" ? "提醒" : "文字") : text
         }
         let labels = [
             "pat": "摸摸",
@@ -1289,6 +1352,8 @@ final class CocoPetView: NSView {
         ]
         if let text {
             payload["text"] = text
+        } else if action == "remind" {
+            payload["text"] = "提醒你喝水，起来走走。"
         }
         guard let body = try? JSONSerialization.data(withJSONObject: payload) else { return }
 
@@ -1306,6 +1371,7 @@ final class CocoPetView: NSView {
             }
             DispatchQueue.main.async {
                 self.sentEventLabels[id] = self.eventLabel(action: action, event: event)
+                self.recordHistory(event: event, incoming: false)
             }
         }.resume()
     }
@@ -1346,6 +1412,123 @@ final class CocoPetView: NSView {
         menu.addItem(item)
     }
 
+    private func historyText(action: String, event: [String: Any]) -> String {
+        let text = ((event["text"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if action == "message" || action == "remind" || action == "feed" {
+            return text.isEmpty ? eventLabel(action: action, event: event) : text
+        }
+        return eventLabel(action: action, event: event)
+    }
+
+    private func recordHistory(event: [String: Any], incoming: Bool) {
+        guard let action = event["action"] as? String else { return }
+        let id = event["id"] as? Int ?? Int(Date().timeIntervalSince1970 * 1000)
+        var entries = loadHistory()
+        if entries.contains(where: { $0.id == id && $0.incoming == incoming }) {
+            return
+        }
+        let entry = PetHistoryEntry(
+            id: id,
+            at: ((event["at"] as? Double) ?? Date().timeIntervalSince1970 * 1000) / 1000,
+            action: action,
+            actor: (event["actor"] as? String) ?? onlineConfig.actorName,
+            petName: (event["petName"] as? String) ?? onlineConfig.petName,
+            petKind: (event["petKind"] as? String) ?? onlineConfig.petKind,
+            text: historyText(action: action, event: event),
+            incoming: incoming
+        )
+        entries.append(entry)
+        entries = entries.sorted { $0.at < $1.at }.suffix(1200)
+        if let data = try? JSONEncoder().encode(Array(entries)) {
+            UserDefaults.standard.set(data, forKey: "juanmao.native.history")
+        }
+    }
+
+    private func loadHistory() -> [PetHistoryEntry] {
+        guard let data = UserDefaults.standard.data(forKey: "juanmao.native.history"),
+              let entries = try? JSONDecoder().decode([PetHistoryEntry].self, from: data) else {
+            return []
+        }
+        return entries
+    }
+
+    private func avatarAttachment(kind: String) -> NSTextAttachment {
+        let size = NSSize(width: 20, height: 22)
+        let image = NSImage(size: size)
+        image.lockFocus()
+        NSGraphicsContext.current?.imageInterpolation = .none
+        let sheet = spriteSheet(for: kind)
+        let source = NSRect(x: 0, y: sheet.size.height - cellHeight, width: cellWidth, height: cellHeight)
+        sheet.draw(in: NSRect(origin: .zero, size: size), from: source, operation: .sourceOver, fraction: 1)
+        image.unlockFocus()
+
+        let attachment = NSTextAttachment()
+        attachment.image = image
+        attachment.bounds = NSRect(x: 0, y: -5, width: size.width, height: size.height)
+        return attachment
+    }
+
+    private func showHistory() {
+        NSApp.activate(ignoringOtherApps: true)
+
+        let alert = NSAlert()
+        alert.messageText = "对话历史"
+        alert.informativeText = "按天保存，只显示到日期。"
+        alert.addButton(withTitle: "关闭")
+
+        let scrollView = NSScrollView(frame: NSRect(x: 0, y: 0, width: 520, height: 360))
+        scrollView.hasVerticalScroller = true
+        scrollView.borderType = .bezelBorder
+
+        let textView = NSTextView(frame: scrollView.bounds)
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.drawsBackground = true
+        textView.backgroundColor = NSColor.windowBackgroundColor
+        textView.textContainerInset = NSSize(width: 12, height: 12)
+
+        let output = NSMutableAttributedString()
+        let dayFormatter = DateFormatter()
+        dayFormatter.locale = Locale(identifier: "zh_CN")
+        dayFormatter.dateFormat = "yyyy-MM-dd"
+        let timeFormatter = DateFormatter()
+        timeFormatter.locale = Locale(identifier: "zh_CN")
+        timeFormatter.dateFormat = "HH:mm"
+        var currentDay = ""
+
+        let titleAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 13, weight: .bold),
+            .foregroundColor: NSColor.secondaryLabelColor
+        ]
+        let lineAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 13, weight: .regular),
+            .foregroundColor: NSColor.labelColor
+        ]
+
+        let entries = loadHistory().sorted { $0.at < $1.at }
+        if entries.isEmpty {
+            output.append(NSAttributedString(string: "还没有对话历史。\n", attributes: lineAttrs))
+        } else {
+            for entry in entries {
+                let date = Date(timeIntervalSince1970: entry.at)
+                let day = dayFormatter.string(from: date)
+                if day != currentDay {
+                    currentDay = day
+                    output.append(NSAttributedString(string: output.length == 0 ? "\(day)\n" : "\n\(day)\n", attributes: titleAttrs))
+                }
+                output.append(NSAttributedString(string: "\(timeFormatter.string(from: date)) ", attributes: titleAttrs))
+                output.append(NSAttributedString(attachment: avatarAttachment(kind: entry.petKind)))
+                let arrow = entry.incoming ? "  \(entry.petName): " : "  我 -> \(entry.petName): "
+                output.append(NSAttributedString(string: "\(arrow)\(entry.text)\n", attributes: lineAttrs))
+            }
+        }
+
+        textView.textStorage?.setAttributedString(output)
+        scrollView.documentView = textView
+        alert.accessoryView = scrollView
+        alert.runModal()
+    }
+
     private func showConnectionSettings() {
         NSApp.activate(ignoringOtherApps: true)
 
@@ -1357,14 +1540,11 @@ final class CocoPetView: NSView {
 
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 420, height: 28))
         field.stringValue = onlineConfig.roomLink
-        field.placeholderString = "https://example.trycloudflare.com/?room=..."
+        field.placeholderString = "直接粘贴完整链接、域名、或聊天里的一整段文字"
         alert.accessoryView = field
 
         guard alert.runModal() == .alertFirstButtonReturn else { return }
-        guard let updated = OnlineConfig.from(input: field.stringValue, current: onlineConfig) else {
-            say("网址格式不对。")
-            return
-        }
+        let updated = OnlineConfig.from(input: field.stringValue, current: onlineConfig) ?? onlineConfig
 
         onlineConfig = updated
         onlineConfig.saveConnection()
@@ -1377,24 +1557,57 @@ final class CocoPetView: NSView {
         NSApp.activate(ignoringOtherApps: true)
 
         let alert = NSAlert()
-        alert.messageText = "发送文字"
-        alert.informativeText = "这句话会出现在对方桌宠和房间记录里。"
-        alert.addButton(withTitle: "发送")
+        alert.messageText = "发送"
+        alert.informativeText = "可以发一段文字，也可以直接提醒喝水或让小狗去串门。"
+        alert.addButton(withTitle: "发送文字")
+        alert.addButton(withTitle: "提醒喝水")
+        alert.addButton(withTitle: "去串门")
         alert.addButton(withTitle: "取消")
 
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 420, height: 28))
         field.placeholderString = "想对对方说什么？"
         alert.accessoryView = field
 
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let response = alert.runModal()
+        if response == .alertSecondButtonReturn {
+            perform("remind")
+            return
+        }
+        if response == .alertThirdButtonReturn {
+            perform("visit")
+            return
+        }
+        guard response == .alertFirstButtonReturn else { return }
+
         let text = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
-
         let clipped = String(text.prefix(240))
         say(clipped)
         showHearts()
         setAnimation("wave", duration: 1.2)
         broadcastOnlineAction("message", text: clipped)
+    }
+
+    private func showFeedPicker() {
+        NSApp.activate(ignoringOtherApps: true)
+
+        let alert = NSAlert()
+        alert.messageText = "投喂"
+        alert.informativeText = "选择一种食物，小狗会去对方那里投喂。"
+        feedOptions.forEach { alert.addButton(withTitle: $0) }
+        alert.addButton(withTitle: "取消")
+
+        let response = alert.runModal()
+        switch response {
+        case .alertFirstButtonReturn:
+            sendFeed(food: feedOptions[0])
+        case .alertSecondButtonReturn:
+            sendFeed(food: feedOptions[1])
+        case .alertThirdButtonReturn:
+            sendFeed(food: feedOptions[2])
+        default:
+            return
+        }
     }
 
     private func markLatestRead() {
@@ -1404,24 +1617,47 @@ final class CocoPetView: NSView {
             return
         }
         for eventID in unread.keys {
-            guard let url = onlineURL(path: "/api/read", queryItems: []) else { continue }
-            let payload: [String: Any] = [
-                "eventId": eventID,
-                "reader": onlineConfig.actorName,
-                "source": syncClientID
-            ]
-            guard let body = try? JSONSerialization.data(withJSONObject: payload) else { continue }
-
-            var request = URLRequest(url: url)
-            request.httpMethod = "POST"
-            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            request.httpBody = body
-            URLSession.shared.dataTask(with: request).resume()
+            markRead(eventID: eventID, announce: false)
         }
         unreadEvents.removeAll()
         lastReadableEventID = nil
         lastReadableEventLabel = nil
+        if stickySpeechEventID != nil {
+            stickySpeechEventID = nil
+        }
         say("已读全部。")
+    }
+
+    private func markRead(eventID: Int, announce: Bool) {
+        guard let url = onlineURL(path: "/api/read", queryItems: []) else { return }
+        let payload: [String: Any] = [
+            "eventId": eventID,
+            "reader": onlineConfig.actorName,
+            "source": syncClientID
+        ]
+        guard let body = try? JSONSerialization.data(withJSONObject: payload) else { return }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = body
+        URLSession.shared.dataTask(with: request) { [weak self] _, _, _ in
+            DispatchQueue.main.async {
+                self?.unreadEvents.removeValue(forKey: eventID)
+                if self?.stickySpeechEventID == eventID {
+                    self?.stickySpeechEventID = nil
+                    if announce {
+                        self?.say("已读。")
+                    } else {
+                        self?.speechTimer?.invalidate()
+                        self?.speechTimer = Timer.scheduledTimer(withTimeInterval: 2.4, repeats: false) { [weak self] _ in
+                            self?.speech = nil
+                            self?.needsDisplay = true
+                        }
+                    }
+                }
+            }
+        }.resume()
     }
 
     private func adjustPetScale(by delta: CGFloat) {
@@ -1440,6 +1676,7 @@ final class CocoPetView: NSView {
     @objc private func menuRemind() { perform("remind") }
     @objc private func menuSendText() { showTextComposer() }
     @objc private func menuMarkRead() { markLatestRead() }
+    @objc private func menuHistory() { showHistory() }
     @objc private func menuScaleUp() { adjustPetScale(by: 0.05) }
     @objc private func menuScaleDown() { adjustPetScale(by: -0.05) }
     @objc private func menuConnectionSettings() { showConnectionSettings() }

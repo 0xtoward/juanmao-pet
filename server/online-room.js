@@ -119,7 +119,9 @@ function markRead(eventID, reader, readerSource) {
     id: nextReceiptID++,
     kind: "read",
     eventId: event.id,
-    eventLabel: event.label,
+    eventLabel: event.action === "feed" && event.text
+      ? `投喂${event.text}`
+      : (["message", "remind"].includes(event.action) && event.text ? event.text : event.label),
     eventAction: event.action,
     eventSource: event.source,
     reader: reader || "对方",
@@ -145,7 +147,7 @@ function pageHTML() {
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>卷毛联机房间</title>
+    <title>桌宠联机房间</title>
     <style>
       :root {
         color-scheme: light;
@@ -331,7 +333,21 @@ function pageHTML() {
         display: grid;
         grid-template-columns: 1fr;
         gap: 8px;
-        margin: 12px 0 22px;
+        margin: 12px 0 10px;
+      }
+      .food-picker {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 8px;
+        margin: 0 0 18px;
+      }
+      .food-picker[hidden] {
+        display: none;
+      }
+      .food-picker button {
+        min-height: 42px;
+        color: #8b5b10;
+        background: #fff8e6;
       }
       .message-row, .scale-row {
         display: flex;
@@ -426,6 +442,25 @@ function pageHTML() {
         color: #2f3946;
         font-weight: 800;
       }
+      .log-line {
+        display: grid;
+        grid-template-columns: auto auto minmax(0, 1fr);
+        align-items: start;
+        gap: 6px;
+      }
+      .pixel-avatar {
+        width: 24px;
+        height: 26px;
+        margin-top: -2px;
+        background-repeat: no-repeat;
+        background-size: 192px 234px;
+        image-rendering: pixelated;
+        filter: drop-shadow(0 2px 0 rgba(40, 44, 54, 0.10));
+      }
+      .avatar-colon {
+        color: var(--muted);
+        font-weight: 900;
+      }
       .receipt {
         color: var(--muted);
         font-size: 12px;
@@ -467,14 +502,14 @@ function pageHTML() {
     <main>
       <section class="pet-side">
         <div class="pet-stage">
-          <div class="bubble" id="bubble">卷毛等你们联机。</div>
-          <div class="dog" id="dog" data-action="idle" aria-label="卷毛"></div>
+          <div class="bubble" id="bubble">选择一只小狗开始联机。</div>
+          <div class="dog" id="dog" data-action="idle" aria-label="桌宠"></div>
           <div class="hearts" id="hearts" aria-hidden="true"></div>
         </div>
       </section>
       <section class="panel">
         <div class="status" id="status" data-live="false"><span class="dot"></span><span id="status-text">连接中</span></div>
-        <h1>卷毛联机房间</h1>
+        <h1 id="room-title">桌宠联机房间</h1>
         <p class="sub">你们可以一起照顾桌面小狗，也可以让自己的狗去对方桌面串门。</p>
         <div class="pet-choice" aria-label="选择狗狗">
           <button type="button" data-pet="cockapoo" aria-pressed="false">卷毛</button>
@@ -489,9 +524,14 @@ function pageHTML() {
           <button type="button" data-action="visit">串门</button>
           <button type="button" data-action="remind">提醒</button>
         </div>
+        <div class="food-picker" id="food-picker" hidden>
+          <button type="button" data-food="小饼干">小饼干</button>
+          <button type="button" data-food="水">水</button>
+          <button type="button" data-food="肉干">肉干</button>
+        </div>
         <div class="message-row">
-          <input id="message" maxlength="240" placeholder="写一句话给对方" aria-label="文字消息">
-          <button type="button" id="send-message">发送</button>
+          <input id="message" maxlength="240" placeholder="给对方写一张小纸条" aria-label="文字消息">
+          <button type="button" id="send-message">发送文字</button>
         </div>
         <div class="scale-row">
           <label for="dog-scale">狗狗大小</label>
@@ -517,26 +557,21 @@ function pageHTML() {
       const source = localStorage.getItem(sourceKey) || "web-" + Math.random().toString(16).slice(2);
       localStorage.setItem(sourceKey, source);
       const labels = { pat: "摸摸", feed: "投喂", walk: "遛弯", miss: "想你", nap: "休息", visit: "串门", remind: "提醒", message: "文字" };
-      const speech = {
-        pat: "被摸摸，好开心。",
-        feed: "卷毛吃到啦。",
-        walk: "卷毛去散步。",
-        miss: "我也想你",
-        nap: "卷毛安心睡觉。",
-        visit: "去串门啦。",
-        remind: "喝水，起来走走。",
-        message: "收到一句话。",
-      };
       const dog = document.querySelector("#dog");
       const bubble = document.querySelector("#bubble");
+      const roomTitle = document.querySelector("#room-title");
       const hearts = document.querySelector("#hearts");
       const log = document.querySelector("#log");
       const status = document.querySelector("#status");
       const statusText = document.querySelector("#status-text");
       const messageInput = document.querySelector("#message");
       const scaleInput = document.querySelector("#dog-scale");
+      const foodPicker = document.querySelector("#food-picker");
       const rows = new Map();
       const eventsById = new Map();
+      const seenReceipts = new Set();
+      const unreadEventIds = new Set();
+      const feedOptions = ["小饼干", "水", "肉干"];
       const petButtons = [...document.querySelectorAll("[data-pet]")];
       const savedScale = localStorage.getItem("juanmao-room-dog-scale");
       if (savedScale) scaleInput.value = savedScale;
@@ -554,11 +589,33 @@ function pageHTML() {
         return petNameForActor();
       }
 
+      function speechFor(action, event = {}) {
+        const petName = event.petName || petNameForActor();
+        const actor = event.actor || "对方";
+        const text = event.text || "";
+        const map = {
+          pat: petName + "被摸摸，好开心。",
+          feed: event.source === source
+            ? petName + "去给对方送" + (text || "小饼干") + "。"
+            : petName + "来投喂：" + (text || "小饼干"),
+          walk: petName + "去散步。",
+          miss: "我也想你",
+          nap: petName + "安心睡觉。",
+          visit: petName + "去串门啦。",
+          remind: text || actor + "提醒你喝水，起来走走。",
+          message: text ? actor + "：" + text : "收到一句话。",
+        };
+        return map[action] || petName + "收到啦。";
+      }
+
       function updatePreviewPet() {
+        const petName = petNameForActor();
         dog.style.backgroundImage = isFriendActor()
           ? 'url("/assets/dachshund-spritesheet.webp")'
           : 'url("/assets/coco-spritesheet.webp")';
-        dog.setAttribute("aria-label", isFriendActor() ? "叶子" : "卷毛");
+        dog.setAttribute("aria-label", petName);
+        roomTitle.textContent = petName + "联机房间";
+        if (!bubble.dataset.locked) bubble.textContent = petName + "等你们联机。";
         petButtons.forEach((button) => {
           button.setAttribute("aria-pressed", String(button.dataset.pet === selectedPet));
         });
@@ -570,8 +627,11 @@ function pageHTML() {
       }
 
       function formatEvent(event) {
-        if (event.action === "message") {
+        if (event.action === "message" || event.action === "remind") {
           return event.text || "发来一句话。";
+        }
+        if (event.action === "feed") {
+          return event.text ? "投喂：" + event.text : "投喂";
         }
         return event.label || labels[event.action] || event.action;
       }
@@ -601,21 +661,36 @@ function pageHTML() {
           item.className = "log-item";
           item.dataset.own = String(own);
           item.dataset.eventId = String(event.id);
-          item.innerHTML = '<div class="log-top"><strong></strong><span class="receipt"></span></div><div class="log-text"></div>';
+          item.innerHTML = '<div class="log-top"><strong></strong><span class="receipt"></span></div><div class="log-line"><span class="pixel-avatar" aria-hidden="true"></span><span class="avatar-colon">:</span><div class="log-text"></div></div>';
           rows.set(event.id, item);
           log.append(item);
           log.scrollTop = log.scrollHeight;
         }
         item.querySelector("strong").textContent = (event.actor || "好友") + "：" + (event.label || labels[event.action] || event.action);
+        item.querySelector(".pixel-avatar").style.backgroundImage = event.petKind === "dachshund"
+          ? 'url("/assets/dachshund-spritesheet.webp")'
+          : 'url("/assets/coco-spritesheet.webp")';
         item.querySelector(".log-text").textContent = formatEvent(event);
         item.querySelector(".receipt").textContent = receiptText(event);
       }
 
       function applyReceipt(receipt) {
+        if (seenReceipts.has(receipt.id)) return;
+        seenReceipts.add(receipt.id);
+        const event = eventsById.get(receipt.eventId);
+        if (event && !(event.readBy || []).some((entry) => entry.source === receipt.readerSource)) {
+          event.readBy = [...(event.readBy || []), { reader: receipt.reader, source: receipt.readerSource, at: receipt.at }];
+        }
         const item = rows.get(receipt.eventId);
         if (item) {
           item.querySelector(".receipt").textContent = (receipt.reader || "对方") + "已读";
         }
+        const label = event ? formatEvent(event) : (receipt.eventLabel || "消息");
+        const text = (receipt.reader || "对方") + "已读了：" + label;
+        addLog(text);
+        bubble.dataset.locked = "true";
+        bubble.textContent = text;
+        showHearts();
       }
 
       function showHearts() {
@@ -628,25 +703,54 @@ function pageHTML() {
         }
       }
 
-      function animate(action, text) {
+      function setBubble(text, locked = false) {
+        bubble.dataset.locked = locked ? "true" : "";
+        bubble.textContent = text;
+      }
+
+      function clearBubbleIfRead() {
+        if (unreadEventIds.size > 0) return;
+        bubble.dataset.locked = "";
+        bubble.textContent = petNameForActor() + "等你们联机。";
+      }
+
+      function animate(action, text, options = {}) {
         dog.dataset.action = action;
-        bubble.textContent = text || speech[action] || "卷毛收到啦。";
-        if (action === "miss" || action === "visit" || action === "remind") showHearts();
+        setBubble(text || speechFor(action, options.event || {}), Boolean(options.sticky));
+        if (action === "miss" || action === "visit" || action === "remind" || action === "feed") showHearts();
         window.clearTimeout(animate.timer);
+        window.clearTimeout(animate.bubbleTimer);
         if (action !== "nap") {
           animate.timer = window.setTimeout(() => {
             dog.dataset.action = "idle";
-          }, 1700);
+          }, options.duration || 1700);
+        }
+        if (!options.sticky) {
+          animate.bubbleTimer = window.setTimeout(clearBubbleIfRead, 2400);
         }
       }
 
-      async function sendAction(action) {
+      function toggleFoodPicker() {
+        foodPicker.hidden = !foodPicker.hidden;
+      }
+
+      async function sendAction(action, selectedFood = "") {
         if (!room) {
           addLog("这个链接缺少房间码。");
           return;
         }
         const actor = actorName();
-        animate(action, action === "miss" ? "我也想你" : undefined);
+        if (action === "feed" && !selectedFood) {
+          toggleFoodPicker();
+          return;
+        }
+        const food = action === "feed" ? selectedFood : "";
+        foodPicker.hidden = true;
+        const eventText = action === "remind" ? "提醒你喝水，起来走走。" : food;
+        const ownText = action === "miss" ? "我也想你" : undefined;
+        animate(action, action === "feed" ? petNameForActor(actor) + "去给对方送" + food + "。" : ownText, {
+          duration: action === "visit" || action === "feed" ? 20000 : 1700
+        });
         const response = await fetch("/api/action?room=" + encodeURIComponent(room), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -655,6 +759,7 @@ function pageHTML() {
             actor,
             petName: petNameForActor(actor),
             petKind: selectedPet,
+            text: eventText,
             source
           })
         }).catch(() => {
@@ -675,7 +780,7 @@ function pageHTML() {
         if (!text) return;
         const actor = actorName();
         messageInput.value = "";
-        bubble.textContent = text;
+        setBubble(text, false);
         const response = await fetch("/api/action?room=" + encodeURIComponent(room), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -706,13 +811,19 @@ function pageHTML() {
         }).catch(() => null);
         if (response?.ok) {
           event.readBy = [...(event.readBy || []), { reader: actor, source, at: Date.now() }];
+          unreadEventIds.delete(event.id);
           renderEvent(event);
+          clearBubbleIfRead();
         }
       }
 
       async function markAllRead() {
         const unread = [...eventsById.values()].filter((event) => event.source !== source && !(event.readBy || []).some((entry) => entry.source === source));
         await Promise.all(unread.map((event) => markRead(event)));
+        unreadEventIds.clear();
+        setBubble("已读全部。", false);
+        window.clearTimeout(animate.bubbleTimer);
+        animate.bubbleTimer = window.setTimeout(clearBubbleIfRead, 1600);
       }
 
       function clearLog() {
@@ -738,13 +849,22 @@ function pageHTML() {
           }
           renderEvent(event);
           if (event.source !== source) {
-            animate(event.action, event.action === "message" ? event.text : (event.action === "miss" ? "我也想你" : speech[event.action]));
+            unreadEventIds.add(event.id);
+            animate(event.action, speechFor(event.action, event), {
+              sticky: event.action !== "visit",
+              duration: event.action === "visit" || event.action === "feed" ? 20000 : 1700,
+              event
+            });
+            if (event.action === "visit") markRead(event);
           }
         };
       }
 
       document.querySelectorAll("[data-action]").forEach((button) => {
         button.addEventListener("click", () => sendAction(button.dataset.action));
+      });
+      document.querySelectorAll("[data-food]").forEach((button) => {
+        button.addEventListener("click", () => sendAction("feed", button.dataset.food));
       });
       petButtons.forEach((button) => {
         button.addEventListener("click", () => {

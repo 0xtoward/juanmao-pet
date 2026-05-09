@@ -76,6 +76,7 @@ ingress:
   - hostname: $HOSTNAME
     service: http://127.0.0.1:$PORT
   - service: http_status:404
+protocol: http2
 EOF
 
 "$CLOUDFLARED" tunnel route dns --overwrite-dns "$TUNNEL_NAME" "$HOSTNAME"
