@@ -61,7 +61,9 @@ elif [ -f "$ROOT/assets/dachshund-spritesheet.webp" ]; then
 fi
 
 if command -v codesign >/dev/null 2>&1; then
-  codesign --force --deep --sign - "$APP" >/dev/null 2>&1 || true
+  xattr -cr "$APP" 2>/dev/null || true
+  codesign --remove-signature "$APP" >/dev/null 2>&1 || true
+  codesign --force --deep --sign - "$APP" >/dev/null
 fi
 
 echo "$APP"

@@ -27,7 +27,16 @@ build_one() {
   "$ROOT/scripts/build-desktop-app.sh" >/dev/null
 
   rm -f "$OUT_DIR/$zip_name"
-  ditto -c -k --sequesterRsrc --keepParent "$ROOT/$app_name.app" "$OUT_DIR/$zip_name"
+  xattr -cr "$ROOT/$app_name.app" 2>/dev/null || true
+  if command -v codesign >/dev/null 2>&1; then
+    codesign --remove-signature "$ROOT/$app_name.app" >/dev/null 2>&1 || true
+    codesign --force --deep --sign - "$ROOT/$app_name.app" >/dev/null
+    codesign --verify --deep --strict "$ROOT/$app_name.app"
+  fi
+  (
+    cd "$ROOT"
+    COPYFILE_DISABLE=1 /usr/bin/zip -qry -X "$OUT_DIR/$zip_name" "$app_name.app"
+  )
   printf "%s\n" "$OUT_DIR/$zip_name"
 }
 

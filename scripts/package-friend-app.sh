@@ -12,7 +12,7 @@ APP_NAME="${APP_NAME:-叶子 Desktop}"
 mkdir -p "$ROOT/dist"
 
 APP_NAME="$APP_NAME" \
-BUNDLE_DISPLAY_NAME="卷毛联机" \
+BUNDLE_DISPLAY_NAME="$FRIEND_PET_NAME" \
 BUNDLE_ID="local.juanmao.interactive.friend" \
 JUANMAO_SERVER_URL="$PUBLIC_URL" \
 JUANMAO_ROOM="$ROOM" \
@@ -22,5 +22,14 @@ JUANMAO_PET_KIND="$FRIEND_PET_KIND" \
 "$ROOT/scripts/build-desktop-app.sh" >/dev/null
 
 rm -f "$ROOT/dist/yezi-desktop.zip"
-ditto -c -k --sequesterRsrc --keepParent "$ROOT/$APP_NAME.app" "$ROOT/dist/yezi-desktop.zip"
+xattr -cr "$ROOT/$APP_NAME.app" 2>/dev/null || true
+if command -v codesign >/dev/null 2>&1; then
+  codesign --remove-signature "$ROOT/$APP_NAME.app" >/dev/null 2>&1 || true
+  codesign --force --deep --sign - "$ROOT/$APP_NAME.app" >/dev/null
+  codesign --verify --deep --strict "$ROOT/$APP_NAME.app"
+fi
+(
+  cd "$ROOT"
+  COPYFILE_DISABLE=1 /usr/bin/zip -qry -X "$ROOT/dist/yezi-desktop.zip" "$APP_NAME.app"
+)
 echo "$ROOT/dist/yezi-desktop.zip"
