@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>卷毛桌面小狗</title>
+    <link rel="stylesheet" href="desktop.css">
+  </head>
+  <body>
+    <main class="widget" aria-label="卷毛桌面小狗">
+      <header class="handle" id="handle" aria-label="拖动窗口">
+        <span>卷毛</span>
+        <button id="close-button" type="button" aria-label="关闭卷毛">x</button>
+      </header>
+
+      <section class="pet-wrap">
+        <section class="pet" id="pet" tabindex="0" aria-label="卷毛，可互动的桌面可卡布">
+          <div class="speech" id="speech" aria-live="polite">卷毛在。</div>
+          <div class="sprite" id="sprite" aria-hidden="true"></div>
+          <div class="float-layer" id="float-layer" aria-hidden="true"></div>
+        </section>
+      </section>
+
+      <section class="meters" aria-label="卷毛状态">
+        <label><span>亲密</span><meter id="love-meter" min="0" max="100"></meter></label>
+        <label><span>饱腹</span><meter id="fullness-meter" min="0" max="100"></meter></label>
+        <label><span>精力</span><meter id="energy-meter" min="0" max="100"></meter></label>
+      </section>
+
+      <nav class="dock" aria-label="互动动作">
+        <button type="button" data-action="pat" title="摸摸">摸摸</button>
+        <button type="button" data-action="feed" title="投喂">投喂</button>
+        <button type="button" data-action="walk" title="遛弯">遛弯</button>
+        <button type="button" data-action="nap" title="休息">休息</button>
+      </nav>
+    </main>
+
+    <script src="desktop.js"></script>
+  </body>
+</html>

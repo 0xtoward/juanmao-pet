@@ -1,0 +1,6 @@
+{
+  "id": "dash",
+  "displayName": "Dash",
+  "description": "A tiny long-bodied dachshund companion for Codex.",
+  "spritesheetPath": "spritesheet.webp"
+}

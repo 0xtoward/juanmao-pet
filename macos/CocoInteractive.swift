@@ -1,0 +1,1508 @@
+import Cocoa
+import QuartzCore
+
+struct PetAnimation {
+    let row: Int
+    let frames: Int
+    let fps: Double
+    let firstFrame: Int
+
+    init(row: Int, frames: Int, fps: Double, firstFrame: Int = 0) {
+        self.row = row
+        self.frames = frames
+        self.fps = fps
+        self.firstFrame = firstFrame
+    }
+}
+
+struct OnlineConfig {
+    let serverURL: String
+    let room: String
+    let actorName: String
+    let petName: String
+    let petKind: String
+
+    var roomLink: String {
+        room.isEmpty ? serverURL : "\(serverURL)/?room=\(room)"
+    }
+
+    static func load() -> OnlineConfig {
+        let fallback = OnlineConfig(
+            serverURL: "http://127.0.0.1:8787",
+            room: "",
+            actorName: "卷毛",
+            petName: "卷毛",
+            petKind: "cockapoo"
+        )
+        let object: [String: Any]
+        if let url = Bundle.main.resourceURL?.appendingPathComponent("online-config.json"),
+           let data = try? Data(contentsOf: url),
+           let decoded = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            object = decoded
+        } else {
+            object = [:]
+        }
+
+        func string(_ key: String, _ defaultValue: String) -> String {
+            guard let value = object[key] as? String else { return defaultValue }
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? defaultValue : trimmed
+        }
+
+        let defaults = UserDefaults.standard
+        let bundledServerURL = normalizeServerURL(string("serverURL", fallback.serverURL))
+        let bundledRoom = string("room", fallback.room)
+        let previousBundledServerURL = defaults.string(forKey: "juanmao.online.lastBundledServerURL").map(normalizeServerURL)
+        let savedServerURL = defaults.string(forKey: "juanmao.online.serverURL").map(normalizeServerURL)
+        let savedRoom = defaults.string(forKey: "juanmao.online.room")
+        let shouldPreferBundledConnection = savedServerURL.map {
+            previousBundledServerURL != bundledServerURL
+                && $0 != bundledServerURL
+                && isDisposableTunnelURL($0)
+        } ?? false
+        let serverURL = shouldPreferBundledConnection ? bundledServerURL : (savedServerURL ?? bundledServerURL)
+        let room = shouldPreferBundledConnection ? bundledRoom : (savedRoom ?? bundledRoom)
+        if shouldPreferBundledConnection {
+            defaults.set(bundledServerURL, forKey: "juanmao.online.serverURL")
+            defaults.set(bundledRoom, forKey: "juanmao.online.room")
+        }
+        defaults.set(bundledServerURL, forKey: "juanmao.online.lastBundledServerURL")
+
+        return OnlineConfig(
+            serverURL: serverURL,
+            room: room.trimmingCharacters(in: .whitespacesAndNewlines),
+            actorName: string("actorName", fallback.actorName),
+            petName: string("petName", fallback.petName),
+            petKind: string("petKind", fallback.petKind)
+        )
+    }
+
+    static func from(input: String, current: OnlineConfig) -> OnlineConfig? {
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        var serverURL = trimmed
+        var room = current.room
+        if let components = URLComponents(string: trimmed),
+           let scheme = components.scheme,
+           let host = components.host {
+            let port = components.port.map { ":\($0)" } ?? ""
+            serverURL = "\(scheme)://\(host)\(port)"
+            if let roomValue = components.queryItems?.first(where: { $0.name == "room" })?.value,
+               !roomValue.isEmpty {
+                room = roomValue
+            }
+        }
+
+        let normalized = normalizeServerURL(serverURL)
+        guard URLComponents(string: normalized)?.scheme != nil else { return nil }
+
+        return OnlineConfig(
+            serverURL: normalized,
+            room: room,
+            actorName: current.actorName,
+            petName: current.petName,
+            petKind: current.petKind
+        )
+    }
+
+    func saveConnection() {
+        let defaults = UserDefaults.standard
+        defaults.set(serverURL, forKey: "juanmao.online.serverURL")
+        defaults.set(room, forKey: "juanmao.online.room")
+    }
+
+    private static func normalizeServerURL(_ value: String) -> String {
+        var trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        while trimmed.hasSuffix("/") {
+            trimmed.removeLast()
+        }
+        return trimmed
+    }
+
+    private static func isDisposableTunnelURL(_ value: String) -> Bool {
+        guard let host = URLComponents(string: value)?.host?.lowercased() else { return false }
+        return host == "trycloudflare.com" || host.hasSuffix(".trycloudflare.com")
+    }
+}
+
+final class CocoPetView: NSView {
+    weak var petWindow: NSWindow?
+
+    private let spriteSheet: NSImage
+    private let dachshundSpriteSheet: NSImage?
+    private var onlineConfig = OnlineConfig.load()
+    private let cellWidth: CGFloat = 192
+    private let cellHeight: CGFloat = 208
+    private var petScale: CGFloat
+    private let petAnimations: [String: PetAnimation] = [
+        "idle": PetAnimation(row: 0, frames: 6, fps: 3),
+        "runRight": PetAnimation(row: 1, frames: 8, fps: 11),
+        "runLeft": PetAnimation(row: 2, frames: 8, fps: 11),
+        "wave": PetAnimation(row: 3, frames: 4, fps: 4),
+        "jump": PetAnimation(row: 4, frames: 5, fps: 7),
+        "failed": PetAnimation(row: 5, frames: 8, fps: 5),
+        "sleep": PetAnimation(row: 5, frames: 1, fps: 1, firstFrame: 5),
+        "waiting": PetAnimation(row: 6, frames: 6, fps: 3),
+        "running": PetAnimation(row: 7, frames: 6, fps: 10)
+    ]
+
+    private var activeAnimation = "idle"
+    private var frameIndex = 0
+    private var lastFrameDate = Date()
+    private var frameTimer: Timer?
+    private var resetTimer: Timer?
+    private var speechTimer: Timer?
+    private var tongueTimer: Timer?
+    private var walkTimer: Timer?
+    private var syncTimer: Timer?
+    private var guestTimer: Timer?
+    private var guestWaveTimer: Timer?
+    private var speech: String?
+    private var guestSpeech: String?
+    private var guestName: String?
+    private var guestKind: String?
+    private var tongueVisible = false
+    private var tongueStartedAt: Date?
+    private var heartsStartedAt: Date?
+    private var guestStartedAt: Date?
+    private var hovering = false
+    private var controlsRevealUntil: Date?
+    private var pressedAction: String?
+    private var dragStartPoint: NSPoint?
+    private var dragStartFrame: NSRect?
+    private var didDrag = false
+    private var handledMouseDownAction = false
+    private var isWalking = false
+    private var guestVisible = false
+    private var guestAnimation = "runRight"
+    private var guestFrameIndex = 0
+    private var guestLastFrameDate = Date()
+    private var walkDirection: CGFloat = -1
+    private let syncClientID = "desktop-\(UUID().uuidString)"
+    private var lastSyncEventID = 0
+    private var lastReceiptID = 0
+    private var syncRequestInFlight = false
+    private var lastReadableEventID: Int?
+    private var lastReadableEventLabel: String?
+    private var unreadEvents: [Int: String] = [:]
+    private var sentEventLabels: [Int: String] = [:]
+
+    private var love: Int
+    private var fullness: Int
+    private var energy: Int
+
+    override var isFlipped: Bool { false }
+
+    init(frame: NSRect, spriteSheet: NSImage, dachshundSpriteSheet: NSImage?) {
+        self.spriteSheet = spriteSheet
+        self.dachshundSpriteSheet = dachshundSpriteSheet
+        let defaults = UserDefaults.standard
+        if defaults.object(forKey: "juanmao.native.love") == nil {
+            self.love = 62
+            self.fullness = 72
+            self.energy = 76
+        } else {
+            self.love = defaults.integer(forKey: "juanmao.native.love")
+            self.fullness = defaults.integer(forKey: "juanmao.native.fullness")
+            self.energy = defaults.integer(forKey: "juanmao.native.energy")
+        }
+        let savedScale = defaults.double(forKey: "juanmao.native.petScale")
+        self.petScale = savedScale > 0 ? min(0.68, max(0.28, CGFloat(savedScale))) : 0.41
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.clear.cgColor
+        startTimer()
+        DistributedNotificationCenter.default().addObserver(
+            self,
+            selector: #selector(handleExternalCommand),
+            name: Notification.Name("local.juanmao.command"),
+            object: nil
+        )
+        startOnlineSync()
+        say("\(onlineConfig.petName)在。")
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    deinit {
+        frameTimer?.invalidate()
+        resetTimer?.invalidate()
+        speechTimer?.invalidate()
+        tongueTimer?.invalidate()
+        walkTimer?.invalidate()
+        syncTimer?.invalidate()
+        guestTimer?.invalidate()
+        guestWaveTimer?.invalidate()
+        DistributedNotificationCenter.default().removeObserver(self)
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.activeAlways, .inVisibleRect, .mouseEnteredAndExited, .mouseMoved],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        updateControlHover(at: convert(event.locationInWindow, from: nil))
+        needsDisplay = true
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        hovering = false
+        controlsRevealUntil = nil
+        pressedAction = nil
+        needsDisplay = true
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        updateControlHover(at: convert(event.locationInWindow, from: nil))
+        needsDisplay = true
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        handledMouseDownAction = false
+        let point = convert(event.locationInWindow, from: nil)
+
+        if let action = action(at: point) {
+            pressedAction = action
+            needsDisplay = true
+            return
+        }
+
+        guard isMainPetHit(at: point) else {
+            return
+        }
+
+        if event.clickCount >= 2 {
+            perform("feed")
+            handledMouseDownAction = true
+            return
+        }
+
+        dragStartPoint = NSEvent.mouseLocation
+        dragStartFrame = petWindow?.frame
+        didDrag = false
+        setAnimation("waiting")
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let startPoint = dragStartPoint,
+              let startFrame = dragStartFrame,
+              let window = petWindow else {
+            return
+        }
+
+        let current = NSEvent.mouseLocation
+        let dx = current.x - startPoint.x
+        let dy = current.y - startPoint.y
+        if hypot(dx, dy) > 3 {
+            didDrag = true
+        }
+        window.setFrameOrigin(NSPoint(x: startFrame.origin.x + dx, y: startFrame.origin.y + dy))
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        defer {
+            pressedAction = nil
+            dragStartPoint = nil
+            dragStartFrame = nil
+            needsDisplay = true
+        }
+
+        if let action = pressedAction {
+            perform(action)
+            return
+        }
+
+        if handledMouseDownAction {
+            return
+        }
+
+        if didDrag {
+            say("换个地方。")
+            setAnimation("idle")
+        } else {
+            perform("pat")
+        }
+    }
+
+    override func rightMouseDown(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        guard isMainPetHit(at: point) || action(at: point) != nil else { return }
+
+        let menu = NSMenu()
+        addMenuItem("摸摸", #selector(menuPat), to: menu)
+        addMenuItem("投喂", #selector(menuFeed), to: menu)
+        addMenuItem("遛弯", #selector(menuWalk), to: menu)
+        addMenuItem("想你", #selector(menuMiss), to: menu)
+        addMenuItem("休息", #selector(menuNap), to: menu)
+        addMenuItem("去串门", #selector(menuVisit), to: menu)
+        addMenuItem("提醒喝水", #selector(menuRemind), to: menu)
+        menu.addItem(.separator())
+        addMenuItem("发送文字...", #selector(menuSendText), to: menu)
+        addMenuItem("已读全部", #selector(menuMarkRead), to: menu)
+        menu.addItem(.separator())
+        addMenuItem("放大狗狗", #selector(menuScaleUp), to: menu)
+        addMenuItem("缩小狗狗", #selector(menuScaleDown), to: menu)
+        menu.addItem(.separator())
+        addMenuItem("设置联机网址...", #selector(menuConnectionSettings), to: menu)
+        menu.addItem(.separator())
+        addMenuItem("关闭 卷毛", #selector(menuClose), to: menu)
+        NSMenu.popUpContextMenu(menu, with: event, for: self)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.clear.setFill()
+        dirtyRect.fill()
+        drawGuestPet()
+        drawGuestSpeech()
+        drawSpeech()
+        drawMainPet()
+        drawTongue()
+        drawSleepAccents()
+        drawHearts()
+        drawControls()
+    }
+
+    private var petRect: NSRect {
+        let width = cellWidth * petScale
+        let height = cellHeight * petScale
+        let centerX = guestVisible ? bounds.width * 0.66 : bounds.width / 2
+        return NSRect(x: centerX - width / 2, y: 70, width: width, height: height)
+    }
+
+    private var guestPetRect: NSRect? {
+        guard guestVisible else { return nil }
+        let width = cellWidth * petScale
+        let height = cellHeight * petScale
+        let targetX = bounds.width * 0.34 - width / 2
+        let elapsed = Date().timeIntervalSince(guestStartedAt ?? Date())
+        let enterProgress = min(1, max(0, CGFloat(elapsed / 0.9)))
+        let leaveProgress = min(1, max(0, CGFloat((elapsed - 6.0) / 0.8)))
+        let easedEnter = 1 - pow(1 - enterProgress, 3)
+        let easedLeave = leaveProgress * leaveProgress
+        let startX = -width - 16
+        let endX = bounds.width + 16
+        let x = targetX * easedEnter + startX * (1 - easedEnter)
+        let leavingX = x * (1 - easedLeave) + endX * easedLeave
+        return NSRect(x: leavingX, y: 70, width: width, height: height)
+    }
+
+    private var controlRects: [(action: String, title: String, rect: NSRect)] {
+        let items = [
+            ("pat", "摸摸"),
+            ("feed", "投喂"),
+            ("walk", "遛弯"),
+            ("miss", "想你"),
+            ("nap", "休息"),
+            ("visit", "串门"),
+            ("remind", "提醒"),
+            ("close", "关闭")
+        ]
+        let buttonWidth: CGFloat = 42
+        let buttonHeight: CGFloat = 24
+        let gap: CGFloat = 6
+        let rowGap: CGFloat = 5
+        let bottomY: CGFloat = 8
+
+        return items.enumerated().map { index, item in
+            let isTopRow = index < 4
+            let rowCount = 4
+            let localIndex = isTopRow ? index : index - 4
+            let totalWidth = CGFloat(rowCount) * buttonWidth + CGFloat(rowCount - 1) * gap
+            let startX = (bounds.width - totalWidth) / 2
+            let y = bottomY + (isTopRow ? buttonHeight + rowGap : 0)
+            let x = startX + CGFloat(localIndex) * (buttonWidth + gap)
+            return (item.0, item.1, NSRect(x: x, y: y, width: buttonWidth, height: buttonHeight))
+        }
+    }
+
+    private func drawMainPet() {
+        drawSprite(
+            sheet: spriteSheet(for: onlineConfig.petKind),
+            animationName: activeAnimation,
+            frame: frameIndex,
+            in: petRect,
+            fraction: 1
+        )
+    }
+
+    private func drawGuestPet() {
+        guard let rect = guestPetRect else { return }
+        drawSprite(
+            sheet: spriteSheet(for: guestKind),
+            animationName: guestAnimation,
+            frame: guestFrameIndex,
+            in: rect,
+            fraction: 0.98
+        )
+    }
+
+    private func spriteSheet(for kind: String?) -> NSImage {
+        if kind == "dachshund" || kind == "dash" {
+            return dachshundSpriteSheet ?? spriteSheet
+        }
+        return spriteSheet
+    }
+
+    private func drawSprite(sheet: NSImage, animationName: String, frame: Int, in rect: NSRect, fraction: CGFloat) {
+        guard let animation = petAnimations[animationName] else { return }
+        let sourceY = sheet.size.height - CGFloat(animation.row + 1) * cellHeight
+        let source = NSRect(
+            x: CGFloat(animation.firstFrame + frame) * cellWidth,
+            y: sourceY,
+            width: cellWidth,
+            height: cellHeight
+        )
+
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current?.imageInterpolation = .none
+        sheet.draw(in: rect, from: source, operation: .sourceOver, fraction: fraction)
+        NSGraphicsContext.restoreGraphicsState()
+    }
+
+    private func drawDachshund(animationName: String, frame: Int, in rect: NSRect, fraction: CGFloat) {
+        let scale = rect.width / cellWidth
+        let facingLeft = animationName == "runLeft"
+        let sleep = animationName == "sleep"
+        let wave = animationName == "wave"
+        let jump = animationName == "jump"
+        let run = animationName == "runLeft" || animationName == "runRight" || animationName == "running"
+        let phase = CGFloat(frame % 8)
+        let bob = sleep ? 0 : (run ? sin(phase * .pi / 2) * 2.4 * scale : sin(phase * .pi / 3) * 1.2 * scale)
+        let jumpOffsets: [CGFloat] = [0, 9, 18, 9, 0]
+        let jumpOffset: CGFloat = jump ? jumpOffsets[min(frame, 4)] * scale : 0
+        let baseY = rect.minY + bob + jumpOffset
+
+        NSGraphicsContext.saveGraphicsState()
+        if let context = NSGraphicsContext.current?.cgContext {
+            context.setAlpha(fraction)
+        }
+        if facingLeft {
+            let transform = NSAffineTransform()
+            transform.translateX(by: rect.midX, yBy: 0)
+            transform.scaleX(by: -1, yBy: 1)
+            transform.translateX(by: -rect.midX, yBy: 0)
+            transform.concat()
+        }
+
+        let outline = NSColor(calibratedRed: 0.20, green: 0.12, blue: 0.08, alpha: 1)
+        let coat = NSColor(calibratedRed: 0.58, green: 0.31, blue: 0.15, alpha: 1)
+        let coatDark = NSColor(calibratedRed: 0.36, green: 0.18, blue: 0.09, alpha: 1)
+        let tan = NSColor(calibratedRed: 0.86, green: 0.59, blue: 0.34, alpha: 1)
+        let highlight = NSColor(calibratedRed: 0.74, green: 0.43, blue: 0.22, alpha: 1)
+
+        func fillStroke(_ path: NSBezierPath, fill: NSColor, width: CGFloat = 1.6) {
+            fill.setFill()
+            outline.setStroke()
+            path.lineWidth = width * scale
+            path.fill()
+            path.stroke()
+        }
+
+        if sleep {
+            let body = NSBezierPath(roundedRect: NSRect(x: rect.minX + 34 * scale, y: baseY + 22 * scale, width: 112 * scale, height: 33 * scale), xRadius: 16 * scale, yRadius: 16 * scale)
+            fillStroke(body, fill: coat)
+            let head = NSBezierPath(ovalIn: NSRect(x: rect.minX + 128 * scale, y: baseY + 18 * scale, width: 36 * scale, height: 32 * scale))
+            fillStroke(head, fill: coat)
+            let ear = NSBezierPath(roundedRect: NSRect(x: rect.minX + 119 * scale, y: baseY + 12 * scale, width: 22 * scale, height: 42 * scale), xRadius: 11 * scale, yRadius: 14 * scale)
+            fillStroke(ear, fill: coatDark)
+            fillStroke(NSBezierPath(ovalIn: NSRect(x: rect.minX + 151 * scale, y: baseY + 27 * scale, width: 12 * scale, height: 9 * scale)), fill: tan, width: 1.2)
+            outline.setStroke()
+            let eye = NSBezierPath()
+            eye.move(to: NSPoint(x: rect.minX + 144 * scale, y: baseY + 39 * scale))
+            eye.curve(to: NSPoint(x: rect.minX + 153 * scale, y: baseY + 39 * scale), controlPoint1: NSPoint(x: rect.minX + 147 * scale, y: baseY + 36 * scale), controlPoint2: NSPoint(x: rect.minX + 150 * scale, y: baseY + 36 * scale))
+            eye.lineWidth = 1.4 * scale
+            eye.stroke()
+            NSGraphicsContext.restoreGraphicsState()
+            return
+        }
+
+        let tail = NSBezierPath()
+        tail.move(to: NSPoint(x: rect.minX + 38 * scale, y: baseY + 62 * scale))
+        tail.curve(to: NSPoint(x: rect.minX + 18 * scale, y: baseY + 81 * scale), controlPoint1: NSPoint(x: rect.minX + 25 * scale, y: baseY + 74 * scale), controlPoint2: NSPoint(x: rect.minX + 19 * scale, y: baseY + 78 * scale))
+        tail.lineWidth = 7 * scale
+        coatDark.setStroke()
+        tail.stroke()
+        tail.lineWidth = 2 * scale
+        outline.setStroke()
+        tail.stroke()
+
+        let body = NSBezierPath(roundedRect: NSRect(x: rect.minX + 33 * scale, y: baseY + 38 * scale, width: 113 * scale, height: 43 * scale), xRadius: 22 * scale, yRadius: 18 * scale)
+        fillStroke(body, fill: coat)
+
+        let chest = NSBezierPath()
+        chest.move(to: NSPoint(x: rect.minX + 126 * scale, y: baseY + 42 * scale))
+        chest.curve(to: NSPoint(x: rect.minX + 139 * scale, y: baseY + 66 * scale), controlPoint1: NSPoint(x: rect.minX + 132 * scale, y: baseY + 46 * scale), controlPoint2: NSPoint(x: rect.minX + 139 * scale, y: baseY + 54 * scale))
+        chest.line(to: NSPoint(x: rect.minX + 117 * scale, y: baseY + 59 * scale))
+        chest.close()
+        fillStroke(chest, fill: tan, width: 1.2)
+
+        let legLift = run ? sin(phase * .pi) * 3 * scale : 0
+        let frontRaised = wave ? (8 + 5 * sin(phase * .pi / 2)) * scale : 0
+        let legs: [(CGFloat, CGFloat, CGFloat)] = [
+            (52, 0, 0),
+            (78, -legLift, 0),
+            (118, legLift, frontRaised),
+            (137, -legLift, 0)
+        ]
+        for (x, y, lift) in legs {
+            let legHeight = (lift > 0 ? 18 : 29) * scale
+            let legRect = NSRect(x: rect.minX + x * scale, y: baseY + 15 * scale + y + lift, width: 12 * scale, height: legHeight)
+            fillStroke(NSBezierPath(roundedRect: legRect, xRadius: 5 * scale, yRadius: 5 * scale), fill: x > 110 ? tan : coatDark, width: 1.2)
+            if lift == 0 {
+                fillStroke(NSBezierPath(ovalIn: NSRect(x: legRect.minX - 2 * scale, y: baseY + 12 * scale + y, width: 18 * scale, height: 9 * scale)), fill: tan, width: 1.0)
+            }
+        }
+
+        let head = NSBezierPath(ovalIn: NSRect(x: rect.minX + 126 * scale, y: baseY + 58 * scale, width: 43 * scale, height: 42 * scale))
+        fillStroke(head, fill: coat)
+        let snout = NSBezierPath(roundedRect: NSRect(x: rect.minX + 151 * scale, y: baseY + 67 * scale, width: 28 * scale, height: 18 * scale), xRadius: 10 * scale, yRadius: 9 * scale)
+        fillStroke(snout, fill: tan, width: 1.2)
+        let ear = NSBezierPath(roundedRect: NSRect(x: rect.minX + 119 * scale, y: baseY + 47 * scale, width: 25 * scale, height: 53 * scale), xRadius: 12 * scale, yRadius: 18 * scale)
+        fillStroke(ear, fill: coatDark)
+
+        let hair = NSBezierPath()
+        hair.move(to: NSPoint(x: rect.minX + 134 * scale, y: baseY + 95 * scale))
+        hair.line(to: NSPoint(x: rect.minX + 127 * scale, y: baseY + 107 * scale))
+        hair.line(to: NSPoint(x: rect.minX + 143 * scale, y: baseY + 100 * scale))
+        hair.line(to: NSPoint(x: rect.minX + 150 * scale, y: baseY + 109 * scale))
+        hair.line(to: NSPoint(x: rect.minX + 153 * scale, y: baseY + 96 * scale))
+        hair.close()
+        fillStroke(hair, fill: highlight, width: 1.1)
+
+        NSColor.black.setFill()
+        NSBezierPath(ovalIn: NSRect(x: rect.minX + 148 * scale, y: baseY + 81 * scale, width: 4.8 * scale, height: 5.5 * scale)).fill()
+        NSBezierPath(ovalIn: NSRect(x: rect.minX + 172 * scale, y: baseY + 73 * scale, width: 7 * scale, height: 6 * scale)).fill()
+
+        outline.setStroke()
+        let smile = NSBezierPath()
+        smile.move(to: NSPoint(x: rect.minX + 160 * scale, y: baseY + 70 * scale))
+        smile.curve(to: NSPoint(x: rect.minX + 168 * scale, y: baseY + 69 * scale), controlPoint1: NSPoint(x: rect.minX + 163 * scale, y: baseY + 66 * scale), controlPoint2: NSPoint(x: rect.minX + 166 * scale, y: baseY + 66 * scale))
+        smile.lineWidth = 1.2 * scale
+        smile.stroke()
+
+        NSGraphicsContext.restoreGraphicsState()
+    }
+
+    private func drawTongue() {
+        guard tongueVisible else { return }
+        if onlineConfig.petKind == "dachshund" {
+            return
+        }
+
+        let elapsed = Date().timeIntervalSince(tongueStartedAt ?? Date())
+        let wiggle = sin(elapsed * 18)
+        let bounce = sin(elapsed * 24)
+        let extend = 0.76 + 0.24 * abs(sin(elapsed * 9))
+        let mouthCenter = pointInPet(sourceX: 92, sourceYFromTop: 99)
+        let tongueTop = pointInPet(sourceX: 92, sourceYFromTop: 103)
+        let mouthWidth = max(10, 25 * petScale)
+        let mouthHeight = max(4, 10 * petScale)
+        let tongueWidth = max(9, 22 * petScale)
+        let tongueHeight = max(12, 30 * petScale) * extend
+        let tongue = NSRect(
+            x: tongueTop.x - tongueWidth / 2 + CGFloat(wiggle) * 2.2,
+            y: tongueTop.y - tongueHeight - CGFloat(bounce) * 1.5,
+            width: tongueWidth,
+            height: tongueHeight
+        )
+
+        NSColor(calibratedRed: 0.62, green: 0.08, blue: 0.14, alpha: 0.32).setStroke()
+        NSColor(calibratedRed: 0.98, green: 0.34, blue: 0.46, alpha: 0.96).setFill()
+        let tonguePath = NSBezierPath(roundedRect: tongue, xRadius: tongueWidth / 2, yRadius: tongueWidth / 2)
+        tonguePath.lineWidth = 0.8
+        tonguePath.fill()
+        tonguePath.stroke()
+
+        NSColor(calibratedRed: 0.76, green: 0.12, blue: 0.25, alpha: 0.72).setStroke()
+        let centerLine = NSBezierPath()
+        centerLine.move(to: NSPoint(x: tongue.midX, y: tongue.minY + 2.5))
+        centerLine.line(to: NSPoint(x: tongue.midX, y: tongue.maxY - 3))
+        centerLine.lineWidth = 0.8
+        centerLine.stroke()
+
+        let mouth = NSRect(
+            x: mouthCenter.x - mouthWidth / 2,
+            y: mouthCenter.y - mouthHeight / 2,
+            width: mouthWidth,
+            height: mouthHeight
+        )
+        NSColor(calibratedWhite: 0.04, alpha: 0.94).setFill()
+        NSBezierPath(ovalIn: mouth).fill()
+    }
+
+    private func drawDachshundTongue() {
+        let elapsed = Date().timeIntervalSince(tongueStartedAt ?? Date())
+        let wiggle = sin(elapsed * 18)
+        let extend = 0.74 + 0.22 * abs(sin(elapsed * 10))
+        let scale = petRect.width / cellWidth
+        let facingLeft = activeAnimation == "runLeft"
+        let mouthX = facingLeft ? petRect.minX + 33 * scale : petRect.minX + 166 * scale
+        let mouthY = petRect.minY + 69 * scale
+        let tongueWidth = max(9, 21 * scale)
+        let tongueHeight = max(11, 27 * scale) * extend
+        let tongue = NSRect(
+            x: mouthX - tongueWidth / 2 + CGFloat(wiggle) * 2.0,
+            y: mouthY - tongueHeight,
+            width: tongueWidth,
+            height: tongueHeight
+        )
+
+        NSColor(calibratedRed: 0.62, green: 0.08, blue: 0.14, alpha: 0.30).setStroke()
+        NSColor(calibratedRed: 0.98, green: 0.36, blue: 0.48, alpha: 0.96).setFill()
+        let path = NSBezierPath(roundedRect: tongue, xRadius: tongueWidth / 2, yRadius: tongueWidth / 2)
+        path.lineWidth = 0.8
+        path.fill()
+        path.stroke()
+    }
+
+    private func drawHearts() {
+        guard let startedAt = heartsStartedAt else { return }
+
+        let elapsed = Date().timeIntervalSince(startedAt)
+        if elapsed > 1.9 {
+            heartsStartedAt = nil
+            return
+        }
+
+        let progress = CGFloat(elapsed / 1.9)
+        let specs: [(CGFloat, CGFloat, CGFloat, CGFloat)] = [
+            (-34, 10, 13, 0.00),
+            (-12, 30, 10, 0.10),
+            (14, 18, 12, 0.18),
+            (34, 38, 9, 0.28),
+            (2, 50, 14, 0.36)
+        ]
+
+        for spec in specs {
+            let localProgress = min(1, max(0, (progress - spec.3) / 0.72))
+            let alpha = max(0, 1 - localProgress)
+            guard alpha > 0 else { continue }
+
+            let center = NSPoint(
+                x: petRect.midX + spec.0,
+                y: petRect.maxY - 8 + spec.1 + localProgress * 32
+            )
+            drawHeart(center: center, size: spec.2 * (0.86 + localProgress * 0.18), alpha: alpha)
+        }
+    }
+
+    private func drawHeart(center: NSPoint, size: CGFloat, alpha: CGFloat) {
+        let scale = size / 32
+        let path = NSBezierPath()
+        path.move(to: NSPoint(x: center.x, y: center.y - 10 * scale))
+        path.curve(
+            to: NSPoint(x: center.x - 16 * scale, y: center.y + 5 * scale),
+            controlPoint1: NSPoint(x: center.x - 14 * scale, y: center.y - 1 * scale),
+            controlPoint2: NSPoint(x: center.x - 18 * scale, y: center.y + 8 * scale)
+        )
+        path.curve(
+            to: NSPoint(x: center.x, y: center.y + 14 * scale),
+            controlPoint1: NSPoint(x: center.x - 14 * scale, y: center.y + 18 * scale),
+            controlPoint2: NSPoint(x: center.x - 4 * scale, y: center.y + 19 * scale)
+        )
+        path.curve(
+            to: NSPoint(x: center.x + 16 * scale, y: center.y + 5 * scale),
+            controlPoint1: NSPoint(x: center.x + 4 * scale, y: center.y + 19 * scale),
+            controlPoint2: NSPoint(x: center.x + 14 * scale, y: center.y + 18 * scale)
+        )
+        path.curve(
+            to: NSPoint(x: center.x, y: center.y - 10 * scale),
+            controlPoint1: NSPoint(x: center.x + 18 * scale, y: center.y + 8 * scale),
+            controlPoint2: NSPoint(x: center.x + 14 * scale, y: center.y - 1 * scale)
+        )
+        path.close()
+
+        NSColor(calibratedRed: 1.0, green: 0.28, blue: 0.56, alpha: alpha * 0.92).setFill()
+        NSColor(calibratedRed: 0.92, green: 0.1, blue: 0.38, alpha: alpha * 0.44).setStroke()
+        path.lineWidth = 0.8
+        path.fill()
+        path.stroke()
+    }
+
+    private func drawSleepAccents() {
+        guard activeAnimation == "sleep" else { return }
+
+        let zzz = "Zzz"
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 16, weight: .bold),
+            .foregroundColor: NSColor(calibratedRed: 0.42, green: 0.55, blue: 0.86, alpha: 0.82)
+        ]
+        let textPoint = NSPoint(x: petRect.maxX - 12, y: petRect.maxY - 4)
+        (zzz as NSString).draw(at: textPoint, withAttributes: attributes)
+
+        guard onlineConfig.petKind != "dachshund" else { return }
+
+        let cheekColor = NSColor(calibratedRed: 1, green: 0.48, blue: 0.62, alpha: 0.35)
+        cheekColor.setFill()
+        let leftCheek = pointInPet(sourceX: 70, sourceYFromTop: 112)
+        let rightCheek = pointInPet(sourceX: 122, sourceYFromTop: 112)
+        NSBezierPath(ovalIn: NSRect(x: leftCheek.x - 4, y: leftCheek.y - 2, width: 8, height: 4)).fill()
+        NSBezierPath(ovalIn: NSRect(x: rightCheek.x - 4, y: rightCheek.y - 2, width: 8, height: 4)).fill()
+    }
+
+    private func pointInPet(sourceX: CGFloat, sourceYFromTop: CGFloat) -> NSPoint {
+        NSPoint(
+            x: petRect.minX + sourceX * petScale,
+            y: petRect.minY + (cellHeight - sourceYFromTop) * petScale
+        )
+    }
+
+    private func drawGuestSpeech() {
+        guard let rect = guestPetRect,
+              let guestSpeech,
+              !guestSpeech.isEmpty else {
+            return
+        }
+
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .center
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 11, weight: .bold),
+            .foregroundColor: NSColor(calibratedWhite: 0.22, alpha: 1),
+            .paragraphStyle: paragraph
+        ]
+        let rawSize = (guestSpeech as NSString).size(withAttributes: attributes)
+        let bubbleWidth = min(max(rawSize.width + 18, 84), 142)
+        let bubbleHeight: CGFloat = 28
+        let bubble = NSRect(
+            x: min(bounds.width - bubbleWidth - 8, max(8, rect.midX - bubbleWidth / 2)),
+            y: min(bounds.height - bubbleHeight - 14, rect.maxY + 6),
+            width: bubbleWidth,
+            height: bubbleHeight
+        )
+
+        NSColor(calibratedRed: 1, green: 0.95, blue: 0.99, alpha: 0.96).setFill()
+        NSColor(calibratedRed: 0.95, green: 0.33, blue: 0.58, alpha: 0.22).setStroke()
+        let path = NSBezierPath(roundedRect: bubble, xRadius: 8, yRadius: 8)
+        path.lineWidth = 1
+        path.fill()
+        path.stroke()
+
+        let arrow = NSBezierPath()
+        arrow.move(to: NSPoint(x: bubble.midX - 6, y: bubble.minY + 1))
+        arrow.line(to: NSPoint(x: bubble.midX, y: bubble.minY - 7))
+        arrow.line(to: NSPoint(x: bubble.midX + 6, y: bubble.minY + 1))
+        arrow.close()
+        NSColor(calibratedRed: 1, green: 0.95, blue: 0.99, alpha: 0.96).setFill()
+        arrow.fill()
+
+        (guestSpeech as NSString).draw(in: bubble.insetBy(dx: 8, dy: 7), withAttributes: attributes)
+    }
+
+    private func drawSpeech() {
+        guard let speech, !speech.isEmpty else { return }
+
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .center
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 12, weight: .bold),
+            .foregroundColor: NSColor(calibratedWhite: 0.18, alpha: 1),
+            .paragraphStyle: paragraph
+        ]
+        let rawSize = (speech as NSString).size(withAttributes: attributes)
+        let bubbleWidth = min(max(rawSize.width + 22, 78), guestVisible ? 142 : bounds.width - 24)
+        let bubbleHeight: CGFloat = 30
+        let bubble = NSRect(
+            x: min(bounds.width - bubbleWidth - 8, max(8, petRect.midX - bubbleWidth / 2)),
+            y: min(bounds.height - bubbleHeight - 12, petRect.maxY + 8),
+            width: bubbleWidth,
+            height: bubbleHeight
+        )
+
+        NSColor.white.withAlphaComponent(0.96).setFill()
+        NSColor(calibratedWhite: 0.1, alpha: 0.14).setStroke()
+        let path = NSBezierPath(roundedRect: bubble, xRadius: 8, yRadius: 8)
+        path.lineWidth = 1
+        path.fill()
+        path.stroke()
+
+        let arrow = NSBezierPath()
+        arrow.move(to: NSPoint(x: bubble.midX - 7, y: bubble.minY + 1))
+        arrow.line(to: NSPoint(x: bubble.midX, y: bubble.minY - 8))
+        arrow.line(to: NSPoint(x: bubble.midX + 7, y: bubble.minY + 1))
+        arrow.close()
+        NSColor.white.withAlphaComponent(0.96).setFill()
+        arrow.fill()
+
+        let textRect = bubble.insetBy(dx: 10, dy: 7)
+        (speech as NSString).draw(in: textRect, withAttributes: attributes)
+    }
+
+    private func drawControls() {
+        guard controlsVisible else { return }
+
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .center
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 10, weight: .bold),
+            .foregroundColor: NSColor(calibratedWhite: 0.18, alpha: 1),
+            .paragraphStyle: paragraph
+        ]
+
+        for item in controlRects {
+            let isPressed = item.action == pressedAction
+            let fill = isPressed
+                ? NSColor(calibratedRed: 0.87, green: 0.94, blue: 0.98, alpha: 0.96)
+                : NSColor.white.withAlphaComponent(0.88)
+            fill.setFill()
+            NSColor(calibratedWhite: 0.1, alpha: 0.14).setStroke()
+            let path = NSBezierPath(roundedRect: item.rect, xRadius: 12, yRadius: 12)
+            path.lineWidth = 1
+            path.fill()
+            path.stroke()
+
+            let textRect = item.rect.insetBy(dx: 3, dy: 6)
+            (item.title as NSString).draw(in: textRect, withAttributes: attributes)
+        }
+    }
+
+    private func action(at point: NSPoint) -> String? {
+        guard controlsVisible else { return nil }
+        return controlRects.first { $0.rect.insetBy(dx: -5, dy: -5).contains(point) }?.action
+    }
+
+    private func isMainPetHit(at point: NSPoint) -> Bool {
+        guard petRect.contains(point) else { return false }
+        let x = (point.x - petRect.minX) / petScale
+        let yFromTop = cellHeight - (point.y - petRect.minY) / petScale
+
+        func ellipse(cx: CGFloat, cy: CGFloat, rx: CGFloat, ry: CGFloat) -> Bool {
+            let dx = (x - cx) / rx
+            let dy = (yFromTop - cy) / ry
+            return dx * dx + dy * dy <= 1
+        }
+
+        if onlineConfig.petKind == "dachshund" {
+            return ellipse(cx: 92, cy: 132, rx: 76, ry: 40)
+                || ellipse(cx: 148, cy: 92, rx: 34, ry: 38)
+                || ellipse(cx: 34, cy: 106, rx: 24, ry: 28)
+        }
+
+        return ellipse(cx: 96, cy: 118, rx: 58, ry: 66)
+            || ellipse(cx: 96, cy: 70, rx: 44, ry: 42)
+            || ellipse(cx: 62, cy: 102, rx: 28, ry: 46)
+            || ellipse(cx: 132, cy: 102, rx: 28, ry: 46)
+    }
+
+    private var controlsVisible: Bool {
+        if pressedAction != nil { return true }
+        if hovering { return true }
+        if let controlsRevealUntil, controlsRevealUntil > Date() { return true }
+        return false
+    }
+
+    private func updateControlHover(at point: NSPoint) {
+        let onMainPet = isMainPetHit(at: point)
+        let onGuestPet = guestPetRect?.insetBy(dx: -10, dy: -10).contains(point) ?? false
+        let onControls = controlRects.contains { $0.rect.insetBy(dx: -8, dy: -8).contains(point) }
+        hovering = onMainPet || onGuestPet || onControls
+        if onMainPet || onGuestPet {
+            controlsRevealUntil = Date().addingTimeInterval(2.2)
+        } else if onControls {
+            controlsRevealUntil = Date().addingTimeInterval(1.2)
+        }
+    }
+
+    private func startTimer() {
+        let timer = Timer(timeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
+            self?.advanceFrameIfNeeded()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        frameTimer = timer
+    }
+
+    private func advanceFrameIfNeeded() {
+        let now = Date()
+        var shouldRedraw = tongueVisible || heartsStartedAt != nil || guestVisible
+
+        if let animation = petAnimations[activeAnimation],
+           now.timeIntervalSince(lastFrameDate) >= 1.0 / animation.fps {
+            frameIndex = (frameIndex + 1) % animation.frames
+            lastFrameDate = now
+            shouldRedraw = true
+        }
+
+        if guestVisible,
+           let animation = petAnimations[guestAnimation],
+           now.timeIntervalSince(guestLastFrameDate) >= 1.0 / animation.fps {
+            guestFrameIndex = (guestFrameIndex + 1) % animation.frames
+            guestLastFrameDate = now
+            shouldRedraw = true
+        }
+
+        if shouldRedraw {
+            needsDisplay = true
+        }
+    }
+
+    private func setAnimation(_ name: String, duration: TimeInterval? = nil, next: String = "idle") {
+        guard petAnimations[name] != nil else { return }
+        activeAnimation = name
+        frameIndex = 0
+        lastFrameDate = Date()
+        resetTimer?.invalidate()
+        if let duration {
+            resetTimer = Timer.scheduledTimer(withTimeInterval: duration, repeats: false) { [weak self] _ in
+                self?.setAnimation(next)
+            }
+        }
+        needsDisplay = true
+    }
+
+    private func say(_ text: String) {
+        speech = text
+        speechTimer?.invalidate()
+        speechTimer = Timer.scheduledTimer(withTimeInterval: 2.4, repeats: false) { [weak self] _ in
+            self?.speech = nil
+            self?.needsDisplay = true
+        }
+        needsDisplay = true
+    }
+
+    private func nudge(love loveDelta: Int = 0, fullness fullnessDelta: Int = 0, energy energyDelta: Int = 0) {
+        love = min(100, max(0, love + loveDelta))
+        fullness = min(100, max(0, fullness + fullnessDelta))
+        energy = min(100, max(0, energy + energyDelta))
+        let defaults = UserDefaults.standard
+        defaults.set(love, forKey: "juanmao.native.love")
+        defaults.set(fullness, forKey: "juanmao.native.fullness")
+        defaults.set(energy, forKey: "juanmao.native.energy")
+    }
+
+    private func perform(_ action: String, broadcast: Bool = true) {
+        if broadcast, action != "close" {
+            broadcastOnlineAction(action)
+        }
+
+        switch action {
+        case "pat": pat()
+        case "feed": feed()
+        case "walk": walk()
+        case "miss": missYou()
+        case "nap": nap()
+        case "visit": visit()
+        case "remind": remind()
+        case "close": NSApp.terminate(nil)
+        default: break
+        }
+    }
+
+    private func pat() {
+        say(["好舒服。", "再摸一下。", "卷毛开心。"].randomElement() ?? "好舒服。")
+        nudge(love: 8, energy: 1)
+        showTongue()
+        setAnimation("wave", duration: 1.35)
+    }
+
+    private func feed() {
+        say(["吃到啦。", "小碗清空。", "能量补满。"].randomElement() ?? "吃到啦。")
+        nudge(love: 4, fullness: 16, energy: 2)
+        setAnimation("jump", duration: 1.0)
+    }
+
+    private func nap() {
+        say(["安心睡一会儿。", "甜甜小睡。", "\(onlineConfig.petName)睡好啦。"].randomElement() ?? "安心睡一会儿。")
+        nudge(fullness: -2, energy: 12)
+        setAnimation("sleep")
+    }
+
+    private func missYou() {
+        say("我也想你")
+        nudge(love: 10, energy: 1)
+        showHearts()
+        setAnimation("wave", duration: 1.8)
+    }
+
+    private func visit() {
+        say("去串门啦。")
+        nudge(love: 6, fullness: -2, energy: -4)
+        showHearts()
+        setAnimation("runRight", duration: 1.7)
+    }
+
+    private func remind() {
+        say("提醒发出啦。")
+        showHearts()
+        setAnimation("wave", duration: 1.2)
+    }
+
+    private func walk(message: String? = nil) {
+        guard !isWalking else {
+            say("\(onlineConfig.petName)正在散步。")
+            return
+        }
+
+        say(message ?? (["出门小跑。", "遛弯开始。", "跟着你走。"].randomElement() ?? "遛弯开始。"))
+        nudge(love: 5, fullness: -5, energy: -9)
+        isWalking = true
+        walkDirection = Bool.random() ? 1 : -1
+        walkTimer?.invalidate()
+        resetTimer?.invalidate()
+        walkStep(remaining: 9)
+    }
+
+    private func walkStep(remaining: Int) {
+        guard remaining > 0, let window = petWindow else {
+            isWalking = false
+            say("散步回来啦。")
+            setAnimation("wave", duration: 1.2)
+            return
+        }
+
+        let currentFrame = window.frame
+        let screen = NSScreen.screens.first { $0.frame.contains(NSPoint(x: currentFrame.midX, y: currentFrame.midY)) } ?? NSScreen.main
+        let visible = screen?.visibleFrame ?? currentFrame
+        let maxX = max(visible.minX, visible.maxX - currentFrame.width)
+        let maxY = max(visible.minY, visible.maxY - currentFrame.height)
+        if currentFrame.origin.x <= visible.minX + 8 {
+            walkDirection = 1
+        } else if currentFrame.origin.x >= maxX - 8 {
+            walkDirection = -1
+        } else if Int.random(in: 0...4) == 0 {
+            walkDirection *= -1
+        }
+
+        let stride = CGFloat.random(in: 82...148)
+        let wanderY = CGFloat.random(in: -30...30)
+        var targetX = currentFrame.origin.x + stride * walkDirection
+        if targetX < visible.minX {
+            targetX = visible.minX
+            walkDirection = 1
+        } else if targetX > maxX {
+            targetX = maxX
+            walkDirection = -1
+        }
+        let targetY = min(maxY, max(visible.minY, currentFrame.origin.y + wanderY))
+        let target = NSPoint(x: targetX, y: targetY)
+        let distance = hypot(target.x - currentFrame.origin.x, target.y - currentFrame.origin.y)
+
+        setAnimation(target.x >= currentFrame.origin.x ? "runRight" : "runLeft")
+        moveWindow(from: currentFrame.origin, to: target, duration: min(1.35, max(0.55, TimeInterval(distance / 150)))) { [weak self] in
+            self?.walkStep(remaining: remaining - 1)
+        }
+    }
+
+    private func showTongue() {
+        tongueVisible = true
+        tongueStartedAt = Date()
+        tongueTimer?.invalidate()
+        tongueTimer = Timer.scheduledTimer(withTimeInterval: 1.7, repeats: false) { [weak self] _ in
+            self?.tongueVisible = false
+            self?.tongueStartedAt = nil
+            self?.needsDisplay = true
+        }
+        needsDisplay = true
+    }
+
+    private func showHearts() {
+        heartsStartedAt = Date()
+        needsDisplay = true
+    }
+
+    private func showGuestVisit(actor: String, petName: String, petKind: String) {
+        guestName = petName
+        guestKind = petKind
+        guestSpeech = "\(petName)来串门"
+        guestStartedAt = Date()
+        guestAnimation = "runRight"
+        guestFrameIndex = 0
+        guestLastFrameDate = Date()
+        guestVisible = true
+        say("\(petName)来了。")
+
+        guestWaveTimer?.invalidate()
+        guestWaveTimer = Timer.scheduledTimer(withTimeInterval: 1.05, repeats: false) { [weak self] _ in
+            self?.guestAnimation = "wave"
+            self?.guestFrameIndex = 0
+            self?.guestLastFrameDate = Date()
+            self?.guestSpeech = "嗨，\(self?.onlineConfig.petName ?? "卷毛")"
+            self?.needsDisplay = true
+        }
+
+        guestTimer?.invalidate()
+        guestTimer = Timer.scheduledTimer(withTimeInterval: 6.9, repeats: false) { [weak self] _ in
+            self?.guestVisible = false
+            self?.guestName = nil
+            self?.guestKind = nil
+            self?.guestSpeech = nil
+            self?.guestStartedAt = nil
+            self?.needsDisplay = true
+        }
+        needsDisplay = true
+    }
+
+    private func startOnlineSync() {
+        let timer = Timer(timeInterval: 0.9, repeats: true) { [weak self] _ in
+            self?.fetchOnlineEvents()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        syncTimer = timer
+    }
+
+    private func fetchOnlineEvents() {
+        guard !syncRequestInFlight else { return }
+        guard let url = onlineURL(
+            path: "/api/events",
+            queryItems: [
+                URLQueryItem(name: "since", value: "\(lastSyncEventID)"),
+                URLQueryItem(name: "sinceReceipt", value: "\(lastReceiptID)"),
+                URLQueryItem(name: "client", value: syncClientID)
+            ]
+        ) else {
+            return
+        }
+        syncRequestInFlight = true
+
+        URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.syncRequestInFlight = false
+                guard let data,
+                      let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let events = payload["events"] as? [[String: Any]] else {
+                    return
+                }
+
+                for event in events {
+                    if let id = event["id"] as? Int {
+                        self.lastSyncEventID = max(self.lastSyncEventID, id)
+                    }
+                    guard let action = event["action"] as? String else { continue }
+                    self.performRemoteOnlineAction(action, event: event)
+                }
+
+                let receipts = payload["receipts"] as? [[String: Any]] ?? []
+                for receipt in receipts {
+                    if let id = receipt["id"] as? Int {
+                        self.lastReceiptID = max(self.lastReceiptID, id)
+                    }
+                    self.performReadReceipt(receipt)
+                }
+            }
+        }.resume()
+    }
+
+    private func onlineURL(path: String, queryItems: [URLQueryItem]) -> URL? {
+        guard var components = URLComponents(string: onlineConfig.serverURL) else { return nil }
+        components.path = path
+        var items = queryItems
+        if onlineConfig.room.isEmpty {
+            items.append(URLQueryItem(name: "desktop", value: "1"))
+        } else {
+            items.append(URLQueryItem(name: "room", value: onlineConfig.room))
+        }
+        components.queryItems = items
+        return components.url
+    }
+
+    private func performRemoteOnlineAction(_ action: String, event: [String: Any]) {
+        let actor = (event["actor"] as? String) ?? "好友"
+        if let id = event["id"] as? Int {
+            lastReadableEventID = id
+            lastReadableEventLabel = eventLabel(action: action, event: event)
+            unreadEvents[id] = lastReadableEventLabel
+        }
+
+        switch action {
+        case "pat":
+            say("\(actor)摸了摸\(onlineConfig.petName)。")
+            nudge(love: 8, energy: 1)
+            showTongue()
+            setAnimation("wave", duration: 1.35)
+        case "feed":
+            say("\(actor)投喂了\(onlineConfig.petName)。")
+            nudge(love: 4, fullness: 16, energy: 2)
+            setAnimation("jump", duration: 1.0)
+        case "walk":
+            walk()
+        case "miss":
+            say("我也想你")
+            nudge(love: 10, energy: 1)
+            showHearts()
+            setAnimation("wave", duration: 1.8)
+        case "nap":
+            say("\(actor)让\(onlineConfig.petName)睡觉。")
+            nudge(fullness: -2, energy: 12)
+            setAnimation("sleep")
+        case "visit":
+            let petName = (event["petName"] as? String) ?? "\(actor)的小狗"
+            let petKind = (event["petKind"] as? String) ?? "cockapoo"
+            showGuestVisit(actor: actor, petName: petName, petKind: petKind)
+        case "remind":
+            showHearts()
+            walk(message: "\(actor)提醒：喝水走走。")
+        case "message":
+            let text = ((event["text"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            say(text.isEmpty ? "\(actor)发来一句话。" : "\(actor)：\(text)")
+            showHearts()
+            setAnimation("wave", duration: 1.2)
+        default:
+            break
+        }
+    }
+
+    private func eventLabel(action: String, event: [String: Any] = [:]) -> String {
+        if action == "message" {
+            let text = ((event["text"] as? String) ?? "文字").trimmingCharacters(in: .whitespacesAndNewlines)
+            return text.isEmpty ? "文字" : text
+        }
+        let labels = [
+            "pat": "摸摸",
+            "feed": "投喂",
+            "walk": "遛弯",
+            "miss": "想你",
+            "nap": "休息",
+            "visit": "串门",
+            "remind": "提醒"
+        ]
+        return labels[action] ?? action
+    }
+
+    private func performReadReceipt(_ receipt: [String: Any]) {
+        let reader = (receipt["reader"] as? String) ?? "对方"
+        let eventID = receipt["eventId"] as? Int
+        let label = eventID.flatMap { sentEventLabels[$0] }
+            ?? (receipt["eventLabel"] as? String)
+            ?? "消息"
+        say("\(reader)已读：\(label)")
+    }
+
+    private func broadcastOnlineAction(_ action: String, text: String? = nil) {
+        guard let url = onlineURL(path: "/api/action", queryItems: []) else { return }
+        var payload: [String: Any] = [
+            "action": action,
+            "actor": onlineConfig.actorName,
+            "petName": onlineConfig.petName,
+            "petKind": onlineConfig.petKind,
+            "source": syncClientID
+        ]
+        if let text {
+            payload["text"] = text
+        }
+        guard let body = try? JSONSerialization.data(withJSONObject: payload) else { return }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = body
+        URLSession.shared.dataTask(with: request) { [weak self] data, _, _ in
+            guard let self,
+                  let data,
+                  let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let event = payload["event"] as? [String: Any],
+                  let id = event["id"] as? Int else {
+                return
+            }
+            DispatchQueue.main.async {
+                self.sentEventLabels[id] = self.eventLabel(action: action, event: event)
+            }
+        }.resume()
+    }
+
+    private func moveWindow(from start: NSPoint, to target: NSPoint, duration: TimeInterval, completion: @escaping () -> Void) {
+        guard let window = petWindow else {
+            isWalking = false
+            return
+        }
+
+        let startedAt = Date()
+        walkTimer?.invalidate()
+        let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self, weak window] timer in
+            guard let self, let window else {
+                timer.invalidate()
+                return
+            }
+
+            let elapsed = Date().timeIntervalSince(startedAt)
+            let progress = min(1, max(0, elapsed / duration))
+            let x = start.x + (target.x - start.x) * progress
+            let y = start.y + (target.y - start.y) * progress
+            window.setFrameOrigin(NSPoint(x: x, y: y))
+
+            if progress >= 1 {
+                timer.invalidate()
+                self.walkTimer = nil
+                completion()
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        walkTimer = timer
+    }
+
+    private func addMenuItem(_ title: String, _ selector: Selector, to menu: NSMenu) {
+        let item = NSMenuItem(title: title, action: selector, keyEquivalent: "")
+        item.target = self
+        menu.addItem(item)
+    }
+
+    private func showConnectionSettings() {
+        NSApp.activate(ignoringOtherApps: true)
+
+        let alert = NSAlert()
+        alert.messageText = "设置联机网址"
+        alert.informativeText = "粘贴新的房间完整链接，或者只填服务器网址。房间码会保存到这台 Mac。"
+        alert.addButton(withTitle: "保存")
+        alert.addButton(withTitle: "取消")
+
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 420, height: 28))
+        field.stringValue = onlineConfig.roomLink
+        field.placeholderString = "https://example.trycloudflare.com/?room=..."
+        alert.accessoryView = field
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        guard let updated = OnlineConfig.from(input: field.stringValue, current: onlineConfig) else {
+            say("网址格式不对。")
+            return
+        }
+
+        onlineConfig = updated
+        onlineConfig.saveConnection()
+        lastSyncEventID = 0
+        say("联机网址已更新。")
+        fetchOnlineEvents()
+    }
+
+    private func showTextComposer() {
+        NSApp.activate(ignoringOtherApps: true)
+
+        let alert = NSAlert()
+        alert.messageText = "发送文字"
+        alert.informativeText = "这句话会出现在对方桌宠和房间记录里。"
+        alert.addButton(withTitle: "发送")
+        alert.addButton(withTitle: "取消")
+
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 420, height: 28))
+        field.placeholderString = "想对对方说什么？"
+        alert.accessoryView = field
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let text = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+
+        let clipped = String(text.prefix(240))
+        say(clipped)
+        showHearts()
+        setAnimation("wave", duration: 1.2)
+        broadcastOnlineAction("message", text: clipped)
+    }
+
+    private func markLatestRead() {
+        let unread = unreadEvents
+        guard !unread.isEmpty else {
+            say("还没有可标记的消息。")
+            return
+        }
+        for eventID in unread.keys {
+            guard let url = onlineURL(path: "/api/read", queryItems: []) else { continue }
+            let payload: [String: Any] = [
+                "eventId": eventID,
+                "reader": onlineConfig.actorName,
+                "source": syncClientID
+            ]
+            guard let body = try? JSONSerialization.data(withJSONObject: payload) else { continue }
+
+            var request = URLRequest(url: url)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = body
+            URLSession.shared.dataTask(with: request).resume()
+        }
+        unreadEvents.removeAll()
+        lastReadableEventID = nil
+        lastReadableEventLabel = nil
+        say("已读全部。")
+    }
+
+    private func adjustPetScale(by delta: CGFloat) {
+        petScale = min(0.68, max(0.28, petScale + delta))
+        UserDefaults.standard.set(Double(petScale), forKey: "juanmao.native.petScale")
+        say("大小 \(Int(round(petScale / 0.41 * 100)))%")
+        needsDisplay = true
+    }
+
+    @objc private func menuPat() { perform("pat") }
+    @objc private func menuFeed() { perform("feed") }
+    @objc private func menuWalk() { perform("walk") }
+    @objc private func menuMiss() { perform("miss") }
+    @objc private func menuNap() { perform("nap") }
+    @objc private func menuVisit() { perform("visit") }
+    @objc private func menuRemind() { perform("remind") }
+    @objc private func menuSendText() { showTextComposer() }
+    @objc private func menuMarkRead() { markLatestRead() }
+    @objc private func menuScaleUp() { adjustPetScale(by: 0.05) }
+    @objc private func menuScaleDown() { adjustPetScale(by: -0.05) }
+    @objc private func menuConnectionSettings() { showConnectionSettings() }
+    @objc private func menuClose() { NSApp.terminate(nil) }
+
+    @objc private func handleExternalCommand(_ notification: Notification) {
+        guard let action = notification.userInfo?["action"] as? String else { return }
+        perform(action, broadcast: false)
+    }
+}
+
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    private var window: NSWindow!
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.setActivationPolicy(.accessory)
+
+        guard let spriteURL = Bundle.main.resourceURL?.appendingPathComponent("assets/coco-spritesheet.png"),
+              let spriteSheet = NSImage(contentsOf: spriteURL) else {
+            NSApp.terminate(nil)
+            return
+        }
+        let dachshundURL = Bundle.main.resourceURL?.appendingPathComponent("assets/dachshund-spritesheet.png")
+        let dachshundSpriteSheet = dachshundURL.flatMap { NSImage(contentsOf: $0) }
+
+        let targetScreen = NSScreen.screens.first { screen in
+            screen.frame.minY == 0 && screen.frame.minX >= 0
+        } ?? NSScreen.main
+        let screenFrame = targetScreen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1200, height: 800)
+        let width: CGFloat = 304
+        let height: CGFloat = 270
+        let frame = NSRect(
+            x: screenFrame.maxX - width - 28,
+            y: screenFrame.minY + 82,
+            width: width,
+            height: height
+        )
+
+        let view = CocoPetView(
+            frame: NSRect(x: 0, y: 0, width: width, height: height),
+            spriteSheet: spriteSheet,
+            dachshundSpriteSheet: dachshundSpriteSheet
+        )
+        window = NSWindow(contentRect: frame, styleMask: [.borderless], backing: .buffered, defer: false)
+        window.acceptsMouseMovedEvents = true
+        window.backgroundColor = .clear
+        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        window.contentView = view
+        window.hasShadow = false
+        window.ignoresMouseEvents = false
+        window.isMovable = false
+        window.isOpaque = false
+        window.isReleasedWhenClosed = false
+        window.level = .floating
+        window.sharingType = .readOnly
+        view.petWindow = window
+
+        window.makeKeyAndOrderFront(nil)
+        window.orderFrontRegardless()
+    }
+}
+
+let app = NSApplication.shared
+let delegate = AppDelegate()
+app.delegate = delegate
+app.run()
