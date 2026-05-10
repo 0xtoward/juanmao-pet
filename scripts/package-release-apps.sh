@@ -45,5 +45,5 @@ build_one() {
   printf "%s\n" "$OUT_DIR/$zip_name"
 }
 
-build_one "卷毛 Desktop" "卷毛" "local.juanmao.interactive.juanmao" "卷毛" "cockapoo" "juanmao-desktop.zip" "15.0"
-build_one "叶子 Desktop" "叶子" "local.juanmao.interactive.yezi" "叶子" "dachshund" "yezi-desktop.zip" "16.0"
+build_one "卷毛 Desktop" "卷毛" "local.juanmao.interactive.juanmao" "卷毛" "cockapoo" "juanmao-desktop.zip" "12.0"
+build_one "叶子 Desktop" "叶子" "local.juanmao.interactive.yezi" "叶子" "dachshund" "yezi-desktop.zip" "12.0"

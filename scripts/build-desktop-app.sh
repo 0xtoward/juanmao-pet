@@ -11,6 +11,7 @@ JUANMAO_PET_NAME="${JUANMAO_PET_NAME:-卷毛}"
 JUANMAO_PET_KIND="${JUANMAO_PET_KIND:-cockapoo}"
 JUANMAO_ACTOR_NAME="${JUANMAO_ACTOR_NAME:-$JUANMAO_PET_NAME}"
 MACOS_DEPLOYMENT_TARGET="${MACOS_DEPLOYMENT_TARGET:-12.0}"
+export JUANMAO_SERVER_URL JUANMAO_ROOM JUANMAO_PET_NAME JUANMAO_PET_KIND JUANMAO_ACTOR_NAME
 APP="$ROOT/$APP_NAME.app"
 CONTENTS="$APP/Contents"
 MACOS="$CONTENTS/MacOS"
@@ -32,6 +33,12 @@ cp "$ROOT/macos/Info.plist" "$CONTENTS/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleName $BUNDLE_DISPLAY_NAME" "$CONTENTS/Info.plist" >/dev/null
 /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $BUNDLE_ID" "$CONTENTS/Info.plist" >/dev/null
 /usr/libexec/PlistBuddy -c "Set :LSMinimumSystemVersion $MACOS_DEPLOYMENT_TARGET" "$CONTENTS/Info.plist" >/dev/null
+if [ "$JUANMAO_PET_KIND" = "dachshund" ] && [ -f "$ROOT/assets/dachshund-spritesheet.png" ]; then
+  ICON_SOURCE="$ROOT/assets/dachshund-spritesheet.png"
+else
+  ICON_SOURCE="$ROOT/assets/coco-spritesheet.png"
+fi
+/usr/bin/swift "$ROOT/scripts/make-app-icon.swift" "$ICON_SOURCE" "$RESOURCES/AppIcon.icns"
 cp "$ROOT/desktop.html" "$RESOURCES/desktop.html"
 cp "$ROOT/desktop.css" "$RESOURCES/desktop.css"
 cp "$ROOT/desktop.js" "$RESOURCES/desktop.js"

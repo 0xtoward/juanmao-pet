@@ -1041,19 +1041,34 @@ final class CocoPetView: NSView {
         setAnimation("wave", duration: 1.35)
     }
 
-    private func feed() {
-        say(["吃到啦。", "小碗清空。", "能量补满。"].randomElement() ?? "吃到啦。")
-        nudge(love: 4, fullness: 16, energy: 2)
-        setAnimation("jump", duration: 1.0)
+    private func feed(food: String? = nil) {
+        let clipped = food?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let options: [String]
+        if let clipped, !clipped.isEmpty {
+            options = [
+                "\(onlineConfig.petName)吃到\(clipped)啦，好开心呀。",
+                "\(clipped)好好吃呀。",
+                "谢谢你的\(clipped)。",
+                "\(onlineConfig.petName)最喜欢\(clipped)了。"
+            ]
+        } else {
+            options = [
+                "\(onlineConfig.petName)好开心呀。",
+                "好好吃呀。",
+                "\(onlineConfig.petName)吃饱啦。",
+                "谢谢投喂。"
+            ]
+        }
+        say(options.randomElement() ?? "好好吃呀。")
+        nudge(love: 6, fullness: 18, energy: 2)
+        showHearts()
+        setAnimation("jump", duration: 1.2)
     }
 
     private func sendFeed(food: String) {
         let clipped = String(food.trimmingCharacters(in: .whitespacesAndNewlines).prefix(24))
         guard !clipped.isEmpty else { return }
-        say("去给对方送\(clipped)。")
-        showHearts()
-        setAnimation("runRight", duration: 2.2)
-        broadcastOnlineAction("feed", text: clipped)
+        feed(food: clipped)
     }
 
     private func nap() {
@@ -1593,7 +1608,7 @@ final class CocoPetView: NSView {
 
         let alert = NSAlert()
         alert.messageText = "投喂"
-        alert.informativeText = "选择一种食物，小狗会去对方那里投喂。"
+        alert.informativeText = "选择一种食物，投喂给\(onlineConfig.petName)。"
         feedOptions.forEach { alert.addButton(withTitle: $0) }
         alert.addButton(withTitle: "取消")
 
@@ -1692,7 +1707,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var window: NSWindow!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        NSApp.setActivationPolicy(.accessory)
+        NSApp.setActivationPolicy(.regular)
 
         guard let spriteURL = Bundle.main.resourceURL?.appendingPathComponent("assets/coco-spritesheet.png"),
               let spriteSheet = NSImage(contentsOf: spriteURL) else {
