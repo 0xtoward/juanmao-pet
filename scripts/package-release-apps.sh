@@ -31,6 +31,7 @@ build_one() {
   rm -f "$OUT_DIR/$zip_name"
   xattr -cr "$ROOT/$app_name.app" 2>/dev/null || true
   xattr -c "$ROOT/$app_name.app" 2>/dev/null || true
+  find "$ROOT/$app_name.app" -exec xattr -c {} + 2>/dev/null || true
   xattr -d com.apple.FinderInfo "$ROOT/$app_name.app" 2>/dev/null || true
   xattr -d 'com.apple.fileprovider.fpfs#P' "$ROOT/$app_name.app" 2>/dev/null || true
   if command -v codesign >/dev/null 2>&1; then

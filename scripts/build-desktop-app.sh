@@ -11,7 +11,10 @@ JUANMAO_PET_NAME="${JUANMAO_PET_NAME:-卷毛}"
 JUANMAO_PET_KIND="${JUANMAO_PET_KIND:-cockapoo}"
 JUANMAO_ACTOR_NAME="${JUANMAO_ACTOR_NAME:-$JUANMAO_PET_NAME}"
 MACOS_DEPLOYMENT_TARGET="${MACOS_DEPLOYMENT_TARGET:-12.0}"
-export JUANMAO_SERVER_URL JUANMAO_ROOM JUANMAO_PET_NAME JUANMAO_PET_KIND JUANMAO_ACTOR_NAME
+GIT_COMMIT="${GIT_COMMIT:-$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)}"
+UPDATE_API_URL="${UPDATE_API_URL:-https://api.github.com/repos/0xtoward/juanmao-pet/commits/main}"
+UPDATE_PAGE_URL="${UPDATE_PAGE_URL:-https://github.com/0xtoward/juanmao-pet}"
+export JUANMAO_SERVER_URL JUANMAO_ROOM JUANMAO_PET_NAME JUANMAO_PET_KIND JUANMAO_ACTOR_NAME GIT_COMMIT UPDATE_API_URL UPDATE_PAGE_URL
 APP="$ROOT/$APP_NAME.app"
 CONTENTS="$APP/Contents"
 MACOS="$CONTENTS/MacOS"
@@ -50,7 +53,10 @@ fs.writeFileSync(file, JSON.stringify({
   room: process.env.JUANMAO_ROOM,
   actorName: process.env.JUANMAO_ACTOR_NAME,
   petName: process.env.JUANMAO_PET_NAME,
-  petKind: process.env.JUANMAO_PET_KIND
+  petKind: process.env.JUANMAO_PET_KIND,
+  gitCommit: process.env.GIT_COMMIT || "",
+  updateAPIURL: process.env.UPDATE_API_URL,
+  updatePageURL: process.env.UPDATE_PAGE_URL
 }, null, 2) + "\n");
 NODE
 cp "$ROOT/assets/coco-spritesheet.webp" "$RESOURCES/assets/coco-spritesheet.webp"
@@ -73,6 +79,7 @@ fi
 if command -v codesign >/dev/null 2>&1; then
   xattr -cr "$APP" 2>/dev/null || true
   xattr -c "$APP" 2>/dev/null || true
+  find "$APP" -exec xattr -c {} + 2>/dev/null || true
   xattr -d com.apple.FinderInfo "$APP" 2>/dev/null || true
   xattr -d 'com.apple.fileprovider.fpfs#P' "$APP" 2>/dev/null || true
   codesign --remove-signature "$APP" >/dev/null 2>&1 || true

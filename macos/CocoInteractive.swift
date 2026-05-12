@@ -21,6 +21,9 @@ struct OnlineConfig {
     let actorName: String
     let petName: String
     let petKind: String
+    let gitCommit: String
+    let updateAPIURL: String
+    let updatePageURL: String
 
     var roomLink: String {
         room.isEmpty ? serverURL : "\(serverURL)/?room=\(room)"
@@ -32,7 +35,10 @@ struct OnlineConfig {
             room: "",
             actorName: "卷毛",
             petName: "卷毛",
-            petKind: "cockapoo"
+            petKind: "cockapoo",
+            gitCommit: "",
+            updateAPIURL: "https://api.github.com/repos/0xtoward/juanmao-pet/commits/main",
+            updatePageURL: "https://github.com/0xtoward/juanmao-pet"
         )
         let object: [String: Any]
         if let url = Bundle.main.resourceURL?.appendingPathComponent("online-config.json"),
@@ -73,7 +79,10 @@ struct OnlineConfig {
             room: room.trimmingCharacters(in: .whitespacesAndNewlines),
             actorName: string("actorName", fallback.actorName),
             petName: string("petName", fallback.petName),
-            petKind: string("petKind", fallback.petKind)
+            petKind: string("petKind", fallback.petKind),
+            gitCommit: string("gitCommit", fallback.gitCommit),
+            updateAPIURL: string("updateAPIURL", fallback.updateAPIURL),
+            updatePageURL: string("updatePageURL", fallback.updatePageURL)
         )
     }
 
@@ -115,7 +124,10 @@ struct OnlineConfig {
             room: room,
             actorName: current.actorName,
             petName: current.petName,
-            petKind: current.petKind
+            petKind: current.petKind,
+            gitCommit: current.gitCommit,
+            updateAPIURL: current.updateAPIURL,
+            updatePageURL: current.updatePageURL
         )
     }
 
@@ -204,7 +216,7 @@ final class CocoPetView: NSView {
     private var guestFrameIndex = 0
     private var guestLastFrameDate = Date()
     private var walkDirection: CGFloat = -1
-    private let syncClientID = "desktop-\(UUID().uuidString)"
+    private let syncClientID = CocoPetView.loadSyncClientID()
     private var lastSyncEventID = 0
     private var lastReceiptID = 0
     private var syncRequestInFlight = false
@@ -212,6 +224,9 @@ final class CocoPetView: NSView {
     private var lastReadableEventLabel: String?
     private var unreadEvents: [Int: String] = [:]
     private var sentEventLabels: [Int: String] = [:]
+    private var peerOnline = false
+    private var staleInteractionInterval: TimeInterval = 30 * 60
+    private var lastRoomInteractionAt = CocoPetView.loadLastRoomInteractionAt()
     private let feedOptions = ["小饼干", "水", "肉干"]
 
     private var love: Int
@@ -219,6 +234,22 @@ final class CocoPetView: NSView {
     private var energy: Int
 
     override var isFlipped: Bool { false }
+
+    private static func loadSyncClientID() -> String {
+        let key = "juanmao.native.syncClientID"
+        let defaults = UserDefaults.standard
+        if let saved = defaults.string(forKey: key), saved.hasPrefix("desktop-") {
+            return saved
+        }
+        let created = "desktop-\(UUID().uuidString)"
+        defaults.set(created, forKey: key)
+        return created
+    }
+
+    private static func loadLastRoomInteractionAt() -> Date? {
+        let timestamp = UserDefaults.standard.double(forKey: "juanmao.native.lastRoomInteractionAt")
+        return timestamp > 0 ? Date(timeIntervalSince1970: timestamp) : nil
+    }
 
     init(frame: NSRect, spriteSheet: NSImage, dachshundSpriteSheet: NSImage?) {
         self.spriteSheet = spriteSheet
@@ -246,6 +277,7 @@ final class CocoPetView: NSView {
             object: nil
         )
         startOnlineSync()
+        checkForGitUpdate()
         say("\(onlineConfig.petName)在。")
     }
 
@@ -297,6 +329,12 @@ final class CocoPetView: NSView {
     override func mouseDown(with event: NSEvent) {
         handledMouseDownAction = false
         let point = convert(event.locationInWindow, from: nil)
+
+        if event.modifierFlags.contains(.control), isMainPetHit(at: point) {
+            showContextMenu(for: event)
+            handledMouseDownAction = true
+            return
+        }
 
         if let action = action(at: point) {
             pressedAction = action
@@ -363,8 +401,11 @@ final class CocoPetView: NSView {
 
     override func rightMouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
-        guard isMainPetHit(at: point) || action(at: point) != nil else { return }
+        guard isMainPetHit(at: point) else { return }
+        showContextMenu(for: event)
+    }
 
+    private func showContextMenu(for event: NSEvent) {
         let menu = NSMenu()
         addMenuItem("摸摸", #selector(menuPat), to: menu)
         addMenuItem("投喂", #selector(menuFeed), to: menu)
@@ -397,6 +438,7 @@ final class CocoPetView: NSView {
         drawTongue()
         drawSleepAccents()
         drawHearts()
+        drawPresenceDot()
         drawControls()
     }
 
@@ -866,6 +908,52 @@ final class CocoPetView: NSView {
         (speech as NSString).draw(in: textRect, withAttributes: attributes)
     }
 
+    private enum PresenceDotState {
+        case offline
+        case idle
+        case online
+    }
+
+    private var presenceDotState: PresenceDotState {
+        guard peerOnline else { return .offline }
+        guard let lastRoomInteractionAt else { return .online }
+        return Date().timeIntervalSince(lastRoomInteractionAt) >= staleInteractionInterval ? .idle : .online
+    }
+
+    private func drawPresenceDot() {
+        let anchor = guestPetRect ?? petRect
+        let dotSize: CGFloat = max(9, min(13, anchor.width * 0.13))
+        let dot = NSRect(
+            x: min(bounds.width - dotSize - 8, max(8, anchor.maxX - dotSize * 0.52)),
+            y: min(bounds.height - dotSize - 8, max(8, anchor.maxY - dotSize * 0.62)),
+            width: dotSize,
+            height: dotSize
+        )
+
+        let color: NSColor
+        switch presenceDotState {
+        case .offline:
+            color = NSColor(calibratedWhite: 0.64, alpha: 1)
+        case .idle:
+            color = NSColor(calibratedRed: 0.96, green: 0.72, blue: 0.18, alpha: 1)
+        case .online:
+            color = NSColor(calibratedRed: 0.22, green: 0.76, blue: 0.36, alpha: 1)
+        }
+
+        NSGraphicsContext.saveGraphicsState()
+        let shadow = NSShadow()
+        shadow.shadowOffset = NSSize(width: 0, height: -1)
+        shadow.shadowBlurRadius = 3
+        shadow.shadowColor = NSColor(calibratedWhite: 0, alpha: 0.18)
+        shadow.set()
+
+        NSColor.white.withAlphaComponent(0.96).setFill()
+        NSBezierPath(ovalIn: dot.insetBy(dx: -3, dy: -3)).fill()
+        color.setFill()
+        NSBezierPath(ovalIn: dot).fill()
+        NSGraphicsContext.restoreGraphicsState()
+    }
+
     private func drawControls() {
         guard controlsVisible else { return }
 
@@ -932,11 +1020,8 @@ final class CocoPetView: NSView {
     private func updateControlHover(at point: NSPoint) {
         let onMainPet = isMainPetHit(at: point)
         let onGuestPet = guestPetRect?.insetBy(dx: -10, dy: -10).contains(point) ?? false
-        let onControls = controlRects.contains { $0.rect.insetBy(dx: -8, dy: -8).contains(point) }
-        hovering = onMainPet || onGuestPet || onControls
+        hovering = onMainPet || onGuestPet
         if onMainPet || onGuestPet {
-            controlsRevealUntil = Date().addingTimeInterval(2.2)
-        } else if onControls {
             controlsRevealUntil = Date().addingTimeInterval(1.2)
         }
     }
@@ -998,6 +1083,22 @@ final class CocoPetView: NSView {
                 self?.needsDisplay = true
             }
         }
+        needsDisplay = true
+    }
+
+    private func serverDate(from value: Any?) -> Date? {
+        guard let number = value as? NSNumber else { return nil }
+        let milliseconds = number.doubleValue
+        guard milliseconds > 0 else { return nil }
+        return Date(timeIntervalSince1970: milliseconds / 1000)
+    }
+
+    private func rememberRoomInteraction(at date: Date = Date()) {
+        if let lastRoomInteractionAt, date <= lastRoomInteractionAt {
+            return
+        }
+        lastRoomInteractionAt = date
+        UserDefaults.standard.set(date.timeIntervalSince1970, forKey: "juanmao.native.lastRoomInteractionAt")
         needsDisplay = true
     }
 
@@ -1216,7 +1317,10 @@ final class CocoPetView: NSView {
             queryItems: [
                 URLQueryItem(name: "since", value: "\(lastSyncEventID)"),
                 URLQueryItem(name: "sinceReceipt", value: "\(lastReceiptID)"),
-                URLQueryItem(name: "client", value: syncClientID)
+                URLQueryItem(name: "client", value: syncClientID),
+                URLQueryItem(name: "actor", value: onlineConfig.actorName),
+                URLQueryItem(name: "petName", value: onlineConfig.petName),
+                URLQueryItem(name: "petKind", value: onlineConfig.petKind)
             ]
         ) else {
             return
@@ -1233,9 +1337,16 @@ final class CocoPetView: NSView {
                     return
                 }
 
+                if let presence = payload["presence"] as? [String: Any] {
+                    self.updatePresence(presence)
+                }
+
                 for event in events {
                     if let id = event["id"] as? Int {
                         self.lastSyncEventID = max(self.lastSyncEventID, id)
+                    }
+                    if self.isOwnEchoEvent(event) {
+                        continue
                     }
                     guard let action = event["action"] as? String else { continue }
                     self.performRemoteOnlineAction(action, event: event)
@@ -1248,6 +1359,53 @@ final class CocoPetView: NSView {
                     }
                     self.performReadReceipt(receipt)
                 }
+            }
+        }.resume()
+    }
+
+    private func updatePresence(_ presence: [String: Any]) {
+        let peers = presence["peers"] as? [[String: Any]] ?? []
+        let isOnline = !peers.isEmpty || ((presence["online"] as? Bool) ?? false)
+        if let idleMilliseconds = presence["idleInteractionMs"] as? NSNumber, idleMilliseconds.doubleValue > 0 {
+            staleInteractionInterval = idleMilliseconds.doubleValue / 1000
+        }
+        if let date = serverDate(from: presence["lastInteractionAt"]) {
+            rememberRoomInteraction(at: date)
+        } else if isOnline && lastRoomInteractionAt == nil {
+            rememberRoomInteraction()
+        }
+
+        peerOnline = isOnline
+        needsDisplay = true
+    }
+
+    private func checkForGitUpdate() {
+        let currentCommit = onlineConfig.gitCommit.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard currentCommit.count >= 7,
+              let url = URL(string: onlineConfig.updateAPIURL) else {
+            return
+        }
+
+        var request = URLRequest(url: url)
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.setValue("JuanmaoPet/1.0", forHTTPHeaderField: "User-Agent")
+        URLSession.shared.dataTask(with: request) { [weak self] data, _, _ in
+            guard let self,
+                  let data,
+                  let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let latestCommit = payload["sha"] as? String else {
+                return
+            }
+            let latest = latestCommit.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard latest.count >= 7,
+                  latest != currentCommit,
+                  !latest.hasPrefix(currentCommit),
+                  !currentCommit.hasPrefix(latest) else {
+                return
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.8) {
+                let short = String(latest.prefix(7))
+                self.say("发现新版本 \(short)。")
             }
         }.resume()
     }
@@ -1266,8 +1424,10 @@ final class CocoPetView: NSView {
     }
 
     private func performRemoteOnlineAction(_ action: String, event: [String: Any]) {
+        guard !isOwnEchoEvent(event) else { return }
         let actor = (event["actor"] as? String) ?? "好友"
         let text = ((event["text"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        rememberRoomInteraction(at: serverDate(from: event["at"]) ?? Date())
         var eventID: Int?
         if let id = event["id"] as? Int {
             eventID = id
@@ -1326,6 +1486,18 @@ final class CocoPetView: NSView {
         }
     }
 
+    private func isOwnEchoEvent(_ event: [String: Any]) -> Bool {
+        if (event["source"] as? String) == syncClientID {
+            return true
+        }
+        let actor = ((event["actor"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let petName = ((event["petName"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let petKind = ((event["petKind"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        return actor == onlineConfig.actorName
+            && petName == onlineConfig.petName
+            && petKind == onlineConfig.petKind
+    }
+
     private func eventLabel(action: String, event: [String: Any] = [:]) -> String {
         if action == "message" || action == "remind" || action == "feed" {
             let fallbackText = action == "message" ? "文字" : ""
@@ -1353,6 +1525,7 @@ final class CocoPetView: NSView {
         let label = eventID.flatMap { sentEventLabels[$0] }
             ?? (receipt["eventLabel"] as? String)
             ?? "消息"
+        rememberRoomInteraction(at: serverDate(from: receipt["at"]) ?? Date())
         say("\(reader)已读：\(label)")
     }
 
@@ -1386,7 +1559,7 @@ final class CocoPetView: NSView {
             }
             DispatchQueue.main.async {
                 self.sentEventLabels[id] = self.eventLabel(action: action, event: event)
-                self.recordHistory(event: event, incoming: false)
+                self.rememberRoomInteraction(at: self.serverDate(from: event["at"]) ?? Date())
             }
         }.resume()
     }
@@ -1658,6 +1831,7 @@ final class CocoPetView: NSView {
         request.httpBody = body
         URLSession.shared.dataTask(with: request) { [weak self] _, _, _ in
             DispatchQueue.main.async {
+                self?.rememberRoomInteraction()
                 self?.unreadEvents.removeValue(forKey: eventID)
                 if self?.stickySpeechEventID == eventID {
                     self?.stickySpeechEventID = nil

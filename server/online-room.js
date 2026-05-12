@@ -11,6 +11,8 @@ const STATE_FILE = path.join(STATE_DIR, "room-state.json");
 const PORT = Number(process.env.PORT || 8787);
 const ROOM_SECRET = process.env.ROOM_SECRET || randomBytes(5).toString("hex");
 const MAX_EVENTS = 240;
+const PRESENCE_TTL_MS = 15_000;
+const IDLE_INTERACTION_MS = 30 * 60 * 1000;
 const ACTIONS = new Set(["pat", "feed", "walk", "miss", "nap", "visit", "remind", "message"]);
 const ACTION_LABELS = {
   pat: "摸摸",
@@ -28,6 +30,7 @@ let nextReceiptID = Date.now();
 let events = [];
 let receipts = [];
 let streams = new Set();
+let presence = new Map();
 
 function loadNextEventID() {
   try {
@@ -75,6 +78,56 @@ function readBody(req) {
 
 function hasRoomAccess(url) {
   return url.searchParams.get("room") === ROOM_SECRET || url.searchParams.get("desktop") === "1";
+}
+
+function prunePresence(now = Date.now()) {
+  for (const [source, item] of presence) {
+    if (now - item.at > PRESENCE_TTL_MS) {
+      presence.delete(source);
+    }
+  }
+}
+
+function touchPresence({ source, actor, petName, petKind, clientKind }) {
+  const id = String(source || "").slice(0, 80);
+  if (!id) return;
+  const now = Date.now();
+  prunePresence(now);
+  presence.set(id, {
+    source: id,
+    actor: String(actor || "好友").slice(0, 18),
+    petName: String(petName || `${actor || "好友"}的小狗`).slice(0, 18),
+    petKind: String(petKind || "cockapoo").slice(0, 24),
+    clientKind: String(clientKind || "desktop").slice(0, 18),
+    at: now,
+  });
+}
+
+function presenceFor(source) {
+  const now = Date.now();
+  prunePresence(now);
+  const peers = [...presence.values()]
+    .filter((item) => item.source !== source)
+    .map((item) => ({
+      source: item.source,
+      actor: item.actor,
+      petName: item.petName,
+      petKind: item.petKind,
+      clientKind: item.clientKind,
+      lastSeenAgo: now - item.at,
+    }));
+  const lastEventAt = events.reduce((latest, item) => Math.max(latest, Number(item.at || 0)), 0);
+  const lastReceiptAt = receipts.reduce((latest, item) => Math.max(latest, Number(item.at || 0)), 0);
+  const lastInteractionAt = Math.max(lastEventAt, lastReceiptAt);
+  const lastInteractionAgo = lastInteractionAt > 0 ? now - lastInteractionAt : null;
+  return {
+    online: peers.length > 0,
+    peers,
+    idleInteractionMs: IDLE_INTERACTION_MS,
+    lastInteractionAt: lastInteractionAt > 0 ? lastInteractionAt : null,
+    lastInteractionAgo,
+    interactionStale: lastInteractionAgo == null ? false : lastInteractionAgo >= IDLE_INTERACTION_MS,
+  };
 }
 
 function addEvent(event) {
@@ -283,7 +336,7 @@ function pageHTML() {
         line-height: 1.6;
       }
       .status {
-        display: inline-flex;
+        display: none;
         align-items: center;
         gap: 8px;
         margin-bottom: 18px;
@@ -302,6 +355,20 @@ function pageHTML() {
         background: var(--gold);
       }
       .status[data-live="true"] .dot { background: var(--green); }
+      .presence-dot {
+        position: absolute;
+        right: 46px;
+        bottom: 102px;
+        width: 14px;
+        height: 14px;
+        border: 3px solid rgba(255,255,255,0.96);
+        border-radius: 50%;
+        background: #9ca3af;
+        box-shadow: 0 6px 16px rgba(43, 54, 72, 0.18);
+        z-index: 2;
+      }
+      .presence-dot[data-state="idle"] { background: var(--gold); }
+      .presence-dot[data-state="online"] { background: var(--green); }
       .pet-choice {
         display: grid;
         grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -504,6 +571,7 @@ function pageHTML() {
         <div class="pet-stage">
           <div class="bubble" id="bubble">选择一只小狗开始联机。</div>
           <div class="dog" id="dog" data-action="idle" aria-label="桌宠"></div>
+          <span class="presence-dot" id="presence-dot" data-state="offline" aria-label="对方不在线"></span>
           <div class="hearts" id="hearts" aria-hidden="true"></div>
         </div>
       </section>
@@ -564,6 +632,7 @@ function pageHTML() {
       const log = document.querySelector("#log");
       const status = document.querySelector("#status");
       const statusText = document.querySelector("#status-text");
+      const presenceDot = document.querySelector("#presence-dot");
       const messageInput = document.querySelector("#message");
       const scaleInput = document.querySelector("#dog-scale");
       const foodPicker = document.querySelector("#food-picker");
@@ -576,6 +645,9 @@ function pageHTML() {
       const savedScale = localStorage.getItem("juanmao-room-dog-scale");
       if (savedScale) scaleInput.value = savedScale;
       let selectedPet = localStorage.getItem("juanmao-room-pet-kind") || "cockapoo";
+      let idleInteractionMs = 30 * 60 * 1000;
+      let lastInteractionAt = Number(localStorage.getItem("juanmao-room-last-interaction-at") || 0);
+      let presenceTimer = null;
 
       function isFriendActor() {
         return selectedPet === "dachshund";
@@ -621,9 +693,59 @@ function pageHTML() {
         });
       }
 
-      function setLive(text, live) {
-        status.dataset.live = String(Boolean(live));
+      function setPresence(text, state) {
+        const normalized = ["offline", "idle", "online"].includes(state) ? state : "offline";
+        status.dataset.live = String(normalized === "online");
+        status.dataset.state = normalized;
         statusText.textContent = text;
+        presenceDot.dataset.state = normalized;
+        presenceDot.setAttribute("aria-label", text);
+      }
+
+      function rememberInteraction(at = Date.now()) {
+        const timestamp = Number(at || 0);
+        if (!timestamp || timestamp <= lastInteractionAt) return;
+        lastInteractionAt = timestamp;
+        localStorage.setItem("juanmao-room-last-interaction-at", String(timestamp));
+      }
+
+      function identityPayload() {
+        const actor = actorName();
+        return {
+          source,
+          actor,
+          petName: petNameForActor(actor),
+          petKind: selectedPet,
+          clientKind: "web",
+        };
+      }
+
+      function renderPresence(presence) {
+        const peers = presence?.peers || [];
+        if (Number(presence?.idleInteractionMs) > 0) idleInteractionMs = Number(presence.idleInteractionMs);
+        if (Number(presence?.lastInteractionAt) > 0) rememberInteraction(Number(presence.lastInteractionAt));
+        if (peers.length > 0) {
+          if (!lastInteractionAt) rememberInteraction();
+          const peer = peers[0];
+          const name = peer.petName || peer.actor || "对方";
+          const stale = lastInteractionAt > 0 && Date.now() - lastInteractionAt >= idleInteractionMs;
+          setPresence(name + (stale ? "30 分钟没互动" : "在线"), stale ? "idle" : "online");
+        } else {
+          setPresence("对方不在线", "offline");
+        }
+      }
+
+      async function pingPresence() {
+        if (!room) return;
+        const response = await fetch("/api/presence?room=" + encodeURIComponent(room), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(identityPayload()),
+        }).catch(() => null);
+        if (response?.ok) {
+          const payload = await response.json();
+          renderPresence(payload.presence);
+        }
       }
 
       function formatEvent(event) {
@@ -654,6 +776,7 @@ function pageHTML() {
 
       function renderEvent(event) {
         const own = event.source === source;
+        rememberInteraction(event.at || Date.now());
         eventsById.set(event.id, event);
         let item = rows.get(event.id);
         if (!item) {
@@ -677,6 +800,7 @@ function pageHTML() {
       function applyReceipt(receipt) {
         if (seenReceipts.has(receipt.id)) return;
         seenReceipts.add(receipt.id);
+        rememberInteraction(receipt.at || Date.now());
         const event = eventsById.get(receipt.eventId);
         if (event && !(event.readBy || []).some((entry) => entry.source === receipt.readerSource)) {
           event.readBy = [...(event.readBy || []), { reader: receipt.reader, source: receipt.readerSource, at: receipt.at }];
@@ -810,6 +934,7 @@ function pageHTML() {
           body: JSON.stringify({ eventId: event.id, reader: actor, source })
         }).catch(() => null);
         if (response?.ok) {
+          rememberInteraction();
           event.readBy = [...(event.readBy || []), { reader: actor, source, at: Date.now() }];
           unreadEventIds.delete(event.id);
           renderEvent(event);
@@ -834,13 +959,26 @@ function pageHTML() {
 
       function startStream() {
         if (!room) {
-          setLive("缺少房间码", false);
+          setPresence("缺少房间码", "offline");
           addLog("请使用带 room 参数的完整链接。");
           return;
         }
-        const stream = new EventSource("/api/stream?room=" + encodeURIComponent(room));
-        stream.onopen = () => setLive("已连接", true);
-        stream.onerror = () => setLive("重连中", false);
+        const identity = identityPayload();
+        const streamParams = new URLSearchParams({
+          room,
+          source,
+          actor: identity.actor,
+          petName: identity.petName,
+          petKind: identity.petKind,
+        });
+        const stream = new EventSource("/api/stream?" + streamParams.toString());
+        stream.onopen = () => {
+          setPresence("等待对方", "offline");
+          pingPresence();
+          window.clearInterval(presenceTimer);
+          presenceTimer = window.setInterval(pingPresence, 5000);
+        };
+        stream.onerror = () => setPresence("重连中", "offline");
         stream.onmessage = (message) => {
           const event = JSON.parse(message.data);
           if (event.kind === "read") {
@@ -871,6 +1009,7 @@ function pageHTML() {
           selectedPet = button.dataset.pet;
           localStorage.setItem("juanmao-room-pet-kind", selectedPet);
           updatePreviewPet();
+          pingPresence();
         });
       });
       document.querySelector("#send-message").addEventListener("click", sendMessage);
@@ -952,9 +1091,16 @@ async function handle(req, res) {
     const since = Number(url.searchParams.get("since") || 0);
     const sinceReceipt = Number(url.searchParams.get("sinceReceipt") || 0);
     const client = url.searchParams.get("client") || "";
+    touchPresence({
+      source: client,
+      actor: url.searchParams.get("actor") || "好友",
+      petName: url.searchParams.get("petName") || "好友的小狗",
+      petKind: url.searchParams.get("petKind") || "cockapoo",
+      clientKind: "desktop",
+    });
     const items = events.filter((event) => event.id > since && event.source !== client);
     const readItems = receipts.filter((receipt) => receipt.id > sinceReceipt && receipt.eventSource === client);
-    send(res, 200, { ok: true, events: items, receipts: readItems });
+    send(res, 200, { ok: true, events: items, receipts: readItems, presence: presenceFor(client) });
     return;
   }
 
@@ -970,8 +1116,57 @@ async function handle(req, res) {
       "X-Accel-Buffering": "no",
     });
     res.write(`event: ready\ndata: ${JSON.stringify({ ok: true })}\n\n`);
+    const source = url.searchParams.get("source") || "";
+    const presenceItem = {
+      source,
+      actor: url.searchParams.get("actor") || "好友",
+      petName: url.searchParams.get("petName") || "好友的小狗",
+      petKind: url.searchParams.get("petKind") || "cockapoo",
+      clientKind: "web",
+    };
+    touchPresence(presenceItem);
+    const presenceTimer = source ? setInterval(() => touchPresence(presenceItem), 5_000) : null;
     streams.add(res);
-    req.on("close", () => streams.delete(res));
+    req.on("close", () => {
+      streams.delete(res);
+      if (presenceTimer) clearInterval(presenceTimer);
+      if (source) presence.delete(source);
+    });
+    return;
+  }
+
+  if (url.pathname === "/api/presence" && req.method === "GET") {
+    if (!hasRoomAccess(url)) {
+      send(res, 403, { ok: false, error: "bad room" });
+      return;
+    }
+    const client = url.searchParams.get("client") || "";
+    send(res, 200, { ok: true, presence: presenceFor(client) });
+    return;
+  }
+
+  if (url.pathname === "/api/presence" && req.method === "POST") {
+    if (!hasRoomAccess(url)) {
+      send(res, 403, { ok: false, error: "bad room" });
+      return;
+    }
+    let payload = {};
+    try {
+      const raw = await readBody(req);
+      payload = raw ? JSON.parse(raw) : {};
+    } catch {
+      send(res, 400, { ok: false, error: "bad json" });
+      return;
+    }
+    const source = String(payload.source || "").slice(0, 80);
+    touchPresence({
+      source,
+      actor: payload.actor,
+      petName: payload.petName,
+      petKind: payload.petKind,
+      clientKind: payload.clientKind || "web",
+    });
+    send(res, 200, { ok: true, presence: presenceFor(source) });
     return;
   }
 
@@ -998,6 +1193,13 @@ async function handle(req, res) {
       send(res, 400, { ok: false, error: "empty message" });
       return;
     }
+    touchPresence({
+      source: payload.source,
+      actor: payload.actor,
+      petName: payload.petName,
+      petKind: payload.petKind,
+      clientKind: "desktop",
+    });
     const event = addEvent({
       action,
       actor: String(payload.actor || "好友").slice(0, 18),
