@@ -26,9 +26,7 @@ const ACTION_LABELS = {
 };
 
 let nextEventID = loadNextEventID();
-let nextReceiptID = Date.now();
 let events = [];
-let receipts = [];
 let streams = new Set();
 let presence = new Map();
 
@@ -96,7 +94,7 @@ function touchPresence({ source, actor, petName, petKind, clientKind }) {
   presence.set(id, {
     source: id,
     actor: String(actor || "好友").slice(0, 18),
-    petName: String(petName || `${actor || "好友"}的小狗`).slice(0, 18),
+    petName: String(petName || "对方小狗").slice(0, 18),
     petKind: String(petKind || "cockapoo").slice(0, 24),
     clientKind: String(clientKind || "desktop").slice(0, 18),
     at: now,
@@ -117,8 +115,7 @@ function presenceFor(source) {
       lastSeenAgo: now - item.at,
     }));
   const lastEventAt = events.reduce((latest, item) => Math.max(latest, Number(item.at || 0)), 0);
-  const lastReceiptAt = receipts.reduce((latest, item) => Math.max(latest, Number(item.at || 0)), 0);
-  const lastInteractionAt = Math.max(lastEventAt, lastReceiptAt);
+  const lastInteractionAt = lastEventAt;
   const lastInteractionAgo = lastInteractionAt > 0 ? now - lastInteractionAt : null;
   return {
     online: peers.length > 0,
@@ -137,12 +134,11 @@ function addEvent(event) {
     kind: event.action === "message" ? "message" : "action",
     action: event.action,
     actor: event.actor || "好友",
-    petName: event.petName || `${event.actor || "好友"}的小狗`,
+    petName: event.petName || "对方小狗",
     petKind: event.petKind || "cockapoo",
     source: event.source || "web",
     label: ACTION_LABELS[event.action] || event.action,
     text: event.text || "",
-    readBy: [],
   };
   events.push(item);
   saveNextEventID();
@@ -159,39 +155,6 @@ function broadcast(item) {
   for (const stream of streams) {
     stream.write(data);
   }
-}
-
-function markRead(eventID, reader, readerSource) {
-  const event = events.find((item) => item.id === eventID);
-  if (!event || event.source === readerSource) return null;
-  const source = readerSource || "reader";
-  if (event.readBy.some((item) => item.source === source)) {
-    return { ok: true, duplicate: true, event };
-  }
-  const read = {
-    id: nextReceiptID++,
-    kind: "read",
-    eventId: event.id,
-    eventLabel: event.action === "feed" && event.text
-      ? `投喂${event.text}`
-      : (["message", "remind"].includes(event.action) && event.text ? event.text : event.label),
-    eventAction: event.action,
-    eventSource: event.source,
-    reader: reader || "对方",
-    readerSource: source,
-    at: Date.now(),
-  };
-  event.readBy.push({
-    reader: read.reader,
-    source,
-    at: read.at,
-  });
-  receipts.push(read);
-  if (receipts.length > MAX_EVENTS) {
-    receipts = receipts.slice(-MAX_EVENTS);
-  }
-  broadcast(read);
-  return { ok: true, duplicate: false, event, read };
 }
 
 function pageHTML() {
@@ -303,6 +266,37 @@ function pageHTML() {
       .dog[data-action="nap"] { animation: none; background-position: -960px -1040px; }
       .dog[data-action="miss"] { animation: wave 0.9s steps(4) infinite; background-position-y: -624px; }
       .dog[data-action="remind"] { animation: run 0.65s steps(8) infinite; background-position-y: -208px; }
+      .dog[data-away="true"] {
+        background-image: none !important;
+        animation: none !important;
+        opacity: 1;
+        filter: drop-shadow(0 14px 10px rgba(46, 58, 39, 0.14));
+      }
+      .dog[data-away="true"]::before {
+        content: "";
+        position: absolute;
+        left: 48px;
+        bottom: 42px;
+        width: 96px;
+        height: 70px;
+        border-radius: 14px 14px 10px 10px;
+        background: #ffefd0;
+        border: 2px solid rgba(133, 86, 50, 0.22);
+        box-shadow: inset 0 -8px 0 rgba(226, 173, 111, 0.22);
+      }
+      .dog[data-away="true"]::after {
+        content: "";
+        position: absolute;
+        left: 42px;
+        bottom: 92px;
+        width: 108px;
+        height: 108px;
+        transform: rotate(45deg);
+        transform-origin: center;
+        border-radius: 10px 6px 0 6px;
+        background: #ed5f68;
+        box-shadow: -3px -3px 0 rgba(134, 48, 62, 0.16);
+      }
       .hearts {
         position: absolute;
         inset: 0;
@@ -494,11 +488,6 @@ function pageHTML() {
         color: var(--muted);
         font-weight: 900;
       }
-      .receipt {
-        color: var(--muted);
-        font-size: 12px;
-        font-weight: 800;
-      }
       .log-tools {
         display: flex;
         gap: 10px;
@@ -570,7 +559,6 @@ function pageHTML() {
           <input id="dog-scale" type="range" min="70" max="135" value="100" aria-label="狗狗大小">
         </div>
         <div class="log-tools">
-          <button type="button" id="read-all">已读全部</button>
           <button type="button" id="clear-log">清除显示</button>
         </div>
         <div class="log" id="log" aria-live="polite"></div>
@@ -599,13 +587,12 @@ function pageHTML() {
       const foodPicker = document.querySelector("#food-picker");
       const rows = new Map();
       const eventsById = new Map();
-      const seenReceipts = new Set();
-      const unreadEventIds = new Set();
       const feedOptions = ["小饼干", "水", "肉干"];
       const petButtons = [...document.querySelectorAll("[data-pet]")];
       const savedScale = localStorage.getItem("juanmao-room-dog-scale");
       if (savedScale) scaleInput.value = savedScale;
       let selectedPet = localStorage.getItem("juanmao-room-pet-kind") || "cockapoo";
+      let awayVisitUntil = 0;
 
       function isFriendActor() {
         return selectedPet === "dachshund";
@@ -619,9 +606,14 @@ function pageHTML() {
         return petNameForActor();
       }
 
+      function displayPetName(event = {}) {
+        if (event.petKind === "dachshund" || event.petKind === "dash") return "叶子";
+        if (event.petKind === "cockapoo") return "卷毛";
+        return event.petName || "对方小狗";
+      }
+
       function speechFor(action, event = {}) {
-        const petName = event.petName || petNameForActor();
-        const actor = event.actor || "对方";
+        const petName = displayPetName(event);
         const text = event.text || "";
         const map = {
           pat: petName + "被摸摸，好开心。",
@@ -632,8 +624,8 @@ function pageHTML() {
           miss: "我也想你",
           nap: petName + "安心睡觉。",
           visit: petName + "去串门啦。",
-          remind: text || actor + "提醒你喝水，起来走走。",
-          message: text ? actor + "：" + text : "收到一句话。",
+          remind: text || petName + "提醒你喝水，起来走走。",
+          message: text ? petName + "：" + text : "收到一句话。",
         };
         return map[action] || petName + "收到啦。";
       }
@@ -672,14 +664,6 @@ function pageHTML() {
         return event.label || labels[event.action] || event.action;
       }
 
-      function receiptText(event) {
-        if (event.source !== source) {
-          return (event.readBy || []).some((item) => item.source === source) ? "我已读" : "未读";
-        }
-        if (!event.readBy || event.readBy.length === 0) return "对方未读";
-        return event.readBy.map((item) => (item.reader || "对方") + "已读").join("，");
-      }
-
       function addLog(text) {
         const item = document.createElement("div");
         item.className = "log-item";
@@ -697,36 +681,16 @@ function pageHTML() {
           item.className = "log-item";
           item.dataset.own = String(own);
           item.dataset.eventId = String(event.id);
-          item.innerHTML = '<div class="log-top"><strong></strong><span class="receipt"></span></div><div class="log-line"><span class="pixel-avatar" aria-hidden="true"></span><span class="avatar-colon">:</span><div class="log-text"></div></div>';
+          item.innerHTML = '<div class="log-top"><strong></strong></div><div class="log-line"><span class="pixel-avatar" aria-hidden="true"></span><span class="avatar-colon">:</span><div class="log-text"></div></div>';
           rows.set(event.id, item);
           log.append(item);
           log.scrollTop = log.scrollHeight;
         }
-        item.querySelector("strong").textContent = (event.actor || "好友") + "：" + (event.label || labels[event.action] || event.action);
+        item.querySelector("strong").textContent = displayPetName(event) + "：" + (event.label || labels[event.action] || event.action);
         item.querySelector(".pixel-avatar").style.backgroundImage = event.petKind === "dachshund"
           ? 'url("/assets/dachshund-spritesheet.webp")'
           : 'url("/assets/coco-spritesheet.webp")';
         item.querySelector(".log-text").textContent = formatEvent(event);
-        item.querySelector(".receipt").textContent = receiptText(event);
-      }
-
-      function applyReceipt(receipt) {
-        if (seenReceipts.has(receipt.id)) return;
-        seenReceipts.add(receipt.id);
-        const event = eventsById.get(receipt.eventId);
-        if (event && !(event.readBy || []).some((entry) => entry.source === receipt.readerSource)) {
-          event.readBy = [...(event.readBy || []), { reader: receipt.reader, source: receipt.readerSource, at: receipt.at }];
-        }
-        const item = rows.get(receipt.eventId);
-        if (item) {
-          item.querySelector(".receipt").textContent = (receipt.reader || "对方") + "已读";
-        }
-        const label = event ? formatEvent(event) : (receipt.eventLabel || "消息");
-        const text = (receipt.reader || "对方") + "已读了：" + label;
-        addLog(text);
-        bubble.dataset.locked = "true";
-        bubble.textContent = text;
-        showHearts();
       }
 
       function showHearts() {
@@ -744,8 +708,7 @@ function pageHTML() {
         bubble.textContent = text;
       }
 
-      function clearBubbleIfRead() {
-        if (unreadEventIds.size > 0) return;
+      function clearBubble() {
         bubble.dataset.locked = "";
         bubble.textContent = petNameForActor() + "等你们联机。";
       }
@@ -762,7 +725,7 @@ function pageHTML() {
           }, options.duration || 1700);
         }
         if (!options.sticky) {
-          animate.bubbleTimer = window.setTimeout(clearBubbleIfRead, 2400);
+          animate.bubbleTimer = window.setTimeout(clearBubble, 2400);
         }
       }
 
@@ -770,11 +733,32 @@ function pageHTML() {
         foodPicker.hidden = !foodPicker.hidden;
       }
 
+      function isAwayVisiting() {
+        return awayVisitUntil > Date.now();
+      }
+
+      function startAwayVisit(text) {
+        awayVisitUntil = Date.now() + 20000;
+        dog.dataset.away = "true";
+        animate("walk", text || petNameForActor() + "在对方家串门。", { duration: 20000 });
+        window.clearTimeout(startAwayVisit.timer);
+        startAwayVisit.timer = window.setTimeout(() => {
+          if (!isAwayVisiting()) dog.dataset.away = "";
+        }, 20000);
+      }
+
+      function updateAwayVisit(text) {
+        if (!isAwayVisiting()) return;
+        awayVisitUntil = Date.now() + 20000;
+        dog.dataset.away = "true";
+        animate("miss", text || petNameForActor() + "在对方家互动。", { duration: 1600 });
+        window.clearTimeout(startAwayVisit.timer);
+        startAwayVisit.timer = window.setTimeout(() => {
+          if (!isAwayVisiting()) dog.dataset.away = "";
+        }, 20000);
+      }
+
       async function sendAction(action, selectedFood = "") {
-        if (!room) {
-          addLog("这个链接缺少房间码。");
-          return;
-        }
         const actor = actorName();
         if (action === "feed" && !selectedFood) {
           toggleFoodPicker();
@@ -782,11 +766,30 @@ function pageHTML() {
         }
         const food = action === "feed" ? selectedFood : "";
         foodPicker.hidden = true;
+        if (["feed", "pat", "miss"].includes(action) && !isAwayVisiting()) {
+          const localText = action === "feed"
+            ? petNameForActor(actor) + "吃到" + food + "。"
+            : undefined;
+          animate(action, localText);
+          return;
+        }
+        if (!room) {
+          addLog("这个链接缺少房间码。");
+          return;
+        }
         const eventText = action === "remind" ? "提醒你喝水，起来走走。" : food;
         const ownText = action === "miss" ? "我也想你" : undefined;
-        animate(action, action === "feed" ? petNameForActor(actor) + "去给对方送" + food + "。" : ownText, {
-          duration: action === "visit" || action === "feed" ? 20000 : 1700
-        });
+        if (action === "visit") {
+          startAwayVisit(petNameForActor(actor) + "去对方家串门。");
+        } else if (action === "feed") {
+          updateAwayVisit(petNameForActor(actor) + "在对方家送" + food + "。");
+        } else if (action === "pat") {
+          updateAwayVisit(petNameForActor(actor) + "在对方家摸摸。");
+        } else if (action === "miss") {
+          updateAwayVisit(petNameForActor(actor) + "在对方家说想你。");
+        } else {
+          animate(action, ownText, { duration: 1700 });
+        }
         const response = await fetch("/api/action?room=" + encodeURIComponent(room), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -837,31 +840,6 @@ function pageHTML() {
         }
       }
 
-      async function markRead(event) {
-        if (!event || event.source === source || (event.readBy || []).some((entry) => entry.source === source)) return;
-        const actor = actorName();
-        const response = await fetch("/api/read?room=" + encodeURIComponent(room), {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ eventId: event.id, reader: actor, source })
-        }).catch(() => null);
-        if (response?.ok) {
-          event.readBy = [...(event.readBy || []), { reader: actor, source, at: Date.now() }];
-          unreadEventIds.delete(event.id);
-          renderEvent(event);
-          clearBubbleIfRead();
-        }
-      }
-
-      async function markAllRead() {
-        const unread = [...eventsById.values()].filter((event) => event.source !== source && !(event.readBy || []).some((entry) => entry.source === source));
-        await Promise.all(unread.map((event) => markRead(event)));
-        unreadEventIds.clear();
-        setBubble("已读全部。", false);
-        window.clearTimeout(animate.bubbleTimer);
-        animate.bubbleTimer = window.setTimeout(clearBubbleIfRead, 1600);
-      }
-
       function clearLog() {
         rows.clear();
         eventsById.clear();
@@ -884,19 +862,12 @@ function pageHTML() {
         const stream = new EventSource("/api/stream?" + streamParams.toString());
         stream.onmessage = (message) => {
           const event = JSON.parse(message.data);
-          if (event.kind === "read") {
-            applyReceipt(event);
-            return;
-          }
           renderEvent(event);
           if (event.source !== source) {
-            unreadEventIds.add(event.id);
             animate(event.action, speechFor(event.action, event), {
-              sticky: event.action !== "visit",
               duration: event.action === "visit" || event.action === "feed" ? 20000 : 1700,
               event
             });
-            if (event.action === "visit") markRead(event);
           }
         };
       }
@@ -915,7 +886,6 @@ function pageHTML() {
         });
       });
       document.querySelector("#send-message").addEventListener("click", sendMessage);
-      document.querySelector("#read-all").addEventListener("click", markAllRead);
       document.querySelector("#clear-log").addEventListener("click", clearLog);
       messageInput.addEventListener("keydown", (event) => {
         if (event.key === "Enter" && !event.shiftKey) {
@@ -991,18 +961,16 @@ async function handle(req, res) {
       return;
     }
     const since = Number(url.searchParams.get("since") || 0);
-    const sinceReceipt = Number(url.searchParams.get("sinceReceipt") || 0);
     const client = url.searchParams.get("client") || "";
     touchPresence({
       source: client,
       actor: url.searchParams.get("actor") || "好友",
-      petName: url.searchParams.get("petName") || "好友的小狗",
+      petName: url.searchParams.get("petName") || "对方小狗",
       petKind: url.searchParams.get("petKind") || "cockapoo",
       clientKind: "desktop",
     });
     const items = events.filter((event) => event.id > since && event.source !== client);
-    const readItems = receipts.filter((receipt) => receipt.id > sinceReceipt && receipt.eventSource === client);
-    send(res, 200, { ok: true, events: items, receipts: readItems, presence: presenceFor(client) });
+    send(res, 200, { ok: true, events: items, presence: presenceFor(client) });
     return;
   }
 
@@ -1022,7 +990,7 @@ async function handle(req, res) {
     const presenceItem = {
       source,
       actor: url.searchParams.get("actor") || "好友",
-      petName: url.searchParams.get("petName") || "好友的小狗",
+      petName: url.searchParams.get("petName") || "对方小狗",
       petKind: url.searchParams.get("petKind") || "cockapoo",
       clientKind: "web",
     };
@@ -1105,7 +1073,7 @@ async function handle(req, res) {
     const event = addEvent({
       action,
       actor: String(payload.actor || "好友").slice(0, 18),
-      petName: String(payload.petName || `${payload.actor || "好友"}的小狗`).slice(0, 18),
+      petName: String(payload.petName || "对方小狗").slice(0, 18),
       petKind: String(payload.petKind || "cockapoo").slice(0, 24),
       source: String(payload.source || "web").slice(0, 80),
       text,
@@ -1115,28 +1083,7 @@ async function handle(req, res) {
   }
 
   if (url.pathname === "/api/read" && req.method === "POST") {
-    if (!hasRoomAccess(url)) {
-      send(res, 403, { ok: false, error: "bad room" });
-      return;
-    }
-    let payload = {};
-    try {
-      const raw = await readBody(req);
-      payload = raw ? JSON.parse(raw) : {};
-    } catch {
-      send(res, 400, { ok: false, error: "bad json" });
-      return;
-    }
-    const result = markRead(
-      Number(payload.eventId || 0),
-      String(payload.reader || "对方").slice(0, 18),
-      String(payload.source || "web").slice(0, 80)
-    );
-    if (!result) {
-      send(res, 404, { ok: false, error: "event not found" });
-      return;
-    }
-    send(res, 200, result);
+    send(res, 200, { ok: true, disabled: true });
     return;
   }
 
