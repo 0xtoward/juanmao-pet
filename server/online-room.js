@@ -335,40 +335,6 @@ function pageHTML() {
         color: var(--muted);
         line-height: 1.6;
       }
-      .status {
-        display: none;
-        align-items: center;
-        gap: 8px;
-        margin-bottom: 18px;
-        padding: 8px 11px;
-        border: 1px solid var(--line);
-        border-radius: 999px;
-        background: white;
-        color: var(--muted);
-        font-size: 13px;
-        font-weight: 800;
-      }
-      .dot {
-        width: 9px;
-        height: 9px;
-        border-radius: 50%;
-        background: var(--gold);
-      }
-      .status[data-live="true"] .dot { background: var(--green); }
-      .presence-dot {
-        position: absolute;
-        right: 46px;
-        bottom: 102px;
-        width: 14px;
-        height: 14px;
-        border: 3px solid rgba(255,255,255,0.96);
-        border-radius: 50%;
-        background: #9ca3af;
-        box-shadow: 0 6px 16px rgba(43, 54, 72, 0.18);
-        z-index: 2;
-      }
-      .presence-dot[data-state="idle"] { background: var(--gold); }
-      .presence-dot[data-state="online"] { background: var(--green); }
       .pet-choice {
         display: grid;
         grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -571,12 +537,10 @@ function pageHTML() {
         <div class="pet-stage">
           <div class="bubble" id="bubble">选择一只小狗开始联机。</div>
           <div class="dog" id="dog" data-action="idle" aria-label="桌宠"></div>
-          <span class="presence-dot" id="presence-dot" data-state="offline" aria-label="对方不在线"></span>
           <div class="hearts" id="hearts" aria-hidden="true"></div>
         </div>
       </section>
       <section class="panel">
-        <div class="status" id="status" data-live="false"><span class="dot"></span><span id="status-text">连接中</span></div>
         <h1 id="room-title">桌宠联机房间</h1>
         <p class="sub">你们可以一起照顾桌面小狗，也可以让自己的狗去对方桌面串门。</p>
         <div class="pet-choice" aria-label="选择狗狗">
@@ -630,9 +594,6 @@ function pageHTML() {
       const roomTitle = document.querySelector("#room-title");
       const hearts = document.querySelector("#hearts");
       const log = document.querySelector("#log");
-      const status = document.querySelector("#status");
-      const statusText = document.querySelector("#status-text");
-      const presenceDot = document.querySelector("#presence-dot");
       const messageInput = document.querySelector("#message");
       const scaleInput = document.querySelector("#dog-scale");
       const foodPicker = document.querySelector("#food-picker");
@@ -645,9 +606,6 @@ function pageHTML() {
       const savedScale = localStorage.getItem("juanmao-room-dog-scale");
       if (savedScale) scaleInput.value = savedScale;
       let selectedPet = localStorage.getItem("juanmao-room-pet-kind") || "cockapoo";
-      let idleInteractionMs = 30 * 60 * 1000;
-      let lastInteractionAt = Number(localStorage.getItem("juanmao-room-last-interaction-at") || 0);
-      let presenceTimer = null;
 
       function isFriendActor() {
         return selectedPet === "dachshund";
@@ -693,22 +651,6 @@ function pageHTML() {
         });
       }
 
-      function setPresence(text, state) {
-        const normalized = ["offline", "idle", "online"].includes(state) ? state : "offline";
-        status.dataset.live = String(normalized === "online");
-        status.dataset.state = normalized;
-        statusText.textContent = text;
-        presenceDot.dataset.state = normalized;
-        presenceDot.setAttribute("aria-label", text);
-      }
-
-      function rememberInteraction(at = Date.now()) {
-        const timestamp = Number(at || 0);
-        if (!timestamp || timestamp <= lastInteractionAt) return;
-        lastInteractionAt = timestamp;
-        localStorage.setItem("juanmao-room-last-interaction-at", String(timestamp));
-      }
-
       function identityPayload() {
         const actor = actorName();
         return {
@@ -718,34 +660,6 @@ function pageHTML() {
           petKind: selectedPet,
           clientKind: "web",
         };
-      }
-
-      function renderPresence(presence) {
-        const peers = presence?.peers || [];
-        if (Number(presence?.idleInteractionMs) > 0) idleInteractionMs = Number(presence.idleInteractionMs);
-        if (Number(presence?.lastInteractionAt) > 0) rememberInteraction(Number(presence.lastInteractionAt));
-        if (peers.length > 0) {
-          if (!lastInteractionAt) rememberInteraction();
-          const peer = peers[0];
-          const name = peer.petName || peer.actor || "对方";
-          const stale = lastInteractionAt > 0 && Date.now() - lastInteractionAt >= idleInteractionMs;
-          setPresence(name + (stale ? "30 分钟没互动" : "在线"), stale ? "idle" : "online");
-        } else {
-          setPresence("对方不在线", "offline");
-        }
-      }
-
-      async function pingPresence() {
-        if (!room) return;
-        const response = await fetch("/api/presence?room=" + encodeURIComponent(room), {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(identityPayload()),
-        }).catch(() => null);
-        if (response?.ok) {
-          const payload = await response.json();
-          renderPresence(payload.presence);
-        }
       }
 
       function formatEvent(event) {
@@ -776,7 +690,6 @@ function pageHTML() {
 
       function renderEvent(event) {
         const own = event.source === source;
-        rememberInteraction(event.at || Date.now());
         eventsById.set(event.id, event);
         let item = rows.get(event.id);
         if (!item) {
@@ -800,7 +713,6 @@ function pageHTML() {
       function applyReceipt(receipt) {
         if (seenReceipts.has(receipt.id)) return;
         seenReceipts.add(receipt.id);
-        rememberInteraction(receipt.at || Date.now());
         const event = eventsById.get(receipt.eventId);
         if (event && !(event.readBy || []).some((entry) => entry.source === receipt.readerSource)) {
           event.readBy = [...(event.readBy || []), { reader: receipt.reader, source: receipt.readerSource, at: receipt.at }];
@@ -934,7 +846,6 @@ function pageHTML() {
           body: JSON.stringify({ eventId: event.id, reader: actor, source })
         }).catch(() => null);
         if (response?.ok) {
-          rememberInteraction();
           event.readBy = [...(event.readBy || []), { reader: actor, source, at: Date.now() }];
           unreadEventIds.delete(event.id);
           renderEvent(event);
@@ -959,7 +870,6 @@ function pageHTML() {
 
       function startStream() {
         if (!room) {
-          setPresence("缺少房间码", "offline");
           addLog("请使用带 room 参数的完整链接。");
           return;
         }
@@ -972,13 +882,6 @@ function pageHTML() {
           petKind: identity.petKind,
         });
         const stream = new EventSource("/api/stream?" + streamParams.toString());
-        stream.onopen = () => {
-          setPresence("等待对方", "offline");
-          pingPresence();
-          window.clearInterval(presenceTimer);
-          presenceTimer = window.setInterval(pingPresence, 5000);
-        };
-        stream.onerror = () => setPresence("重连中", "offline");
         stream.onmessage = (message) => {
           const event = JSON.parse(message.data);
           if (event.kind === "read") {
@@ -1009,7 +912,6 @@ function pageHTML() {
           selectedPet = button.dataset.pet;
           localStorage.setItem("juanmao-room-pet-kind", selectedPet);
           updatePreviewPet();
-          pingPresence();
         });
       });
       document.querySelector("#send-message").addEventListener("click", sendMessage);

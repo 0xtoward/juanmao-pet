@@ -5,6 +5,8 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PUBLIC_URL="${PUBLIC_URL:-http://127.0.0.1:8787}"
 ROOM="${ROOM:-}"
 OUT_DIR="${OUT_DIR:-$ROOT/dist/release}"
+BUILD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/juanmao-release.XXXXXX")"
+trap 'rm -rf "$BUILD_DIR"' EXIT
 
 mkdir -p "$OUT_DIR"
 
@@ -26,25 +28,17 @@ build_one() {
   JUANMAO_ACTOR_NAME="$pet_name" \
   JUANMAO_PET_NAME="$pet_name" \
   JUANMAO_PET_KIND="$pet_kind" \
+  APP_OUTPUT_DIR="$BUILD_DIR" \
   "$ROOT/scripts/build-desktop-app.sh" >/dev/null
 
   rm -f "$OUT_DIR/$zip_name"
-  xattr -cr "$ROOT/$app_name.app" 2>/dev/null || true
-  xattr -c "$ROOT/$app_name.app" 2>/dev/null || true
-  find "$ROOT/$app_name.app" -exec xattr -c {} + 2>/dev/null || true
-  xattr -d com.apple.FinderInfo "$ROOT/$app_name.app" 2>/dev/null || true
-  xattr -d 'com.apple.fileprovider.fpfs#P' "$ROOT/$app_name.app" 2>/dev/null || true
-  if command -v codesign >/dev/null 2>&1; then
-    codesign --remove-signature "$ROOT/$app_name.app" >/dev/null 2>&1 || true
-    codesign --force --deep --sign - "$ROOT/$app_name.app" >/dev/null
-    codesign --verify --deep --strict "$ROOT/$app_name.app"
-  fi
+  codesign --verify --deep --strict "$BUILD_DIR/$app_name.app"
   (
-    cd "$ROOT"
+    cd "$BUILD_DIR"
     COPYFILE_DISABLE=1 /usr/bin/zip -qry -X "$OUT_DIR/$zip_name" "$app_name.app"
   )
   printf "%s\n" "$OUT_DIR/$zip_name"
 }
 
-build_one "卷毛 Desktop" "卷毛" "local.juanmao.interactive.juanmao" "卷毛" "cockapoo" "juanmao-desktop.zip" "12.0"
-build_one "叶子 Desktop" "叶子" "local.juanmao.interactive.yezi" "叶子" "dachshund" "yezi-desktop.zip" "12.0"
+build_one "卷毛 Desktop" "卷毛" "local.juanmao.interactive.juanmao" "卷毛" "cockapoo" "juanmao-desktop.zip" "15.0"
+build_one "叶子 Desktop" "叶子" "local.juanmao.interactive.yezi" "叶子" "dachshund" "yezi-desktop.zip" "16.0"
