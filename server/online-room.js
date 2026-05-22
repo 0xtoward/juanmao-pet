@@ -88,26 +88,17 @@ function prunePresence(now = Date.now()) {
   }
 }
 
-function booleanValue(value, fallback = false) {
-  if (value === undefined || value === null || value === "") return fallback;
-  if (typeof value === "boolean") return value;
-  const normalized = String(value).trim().toLowerCase();
-  return normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "online";
-}
-
-function touchPresence({ source, actor, petName, petKind, clientKind, manualOnline }) {
+function touchPresence({ source, actor, petName, petKind, clientKind }) {
   const id = String(source || "").slice(0, 80);
   if (!id) return;
   const now = Date.now();
   prunePresence(now);
-  const previous = presence.get(id);
   presence.set(id, {
     source: id,
     actor: String(actor || "好友").slice(0, 18),
     petName: String(petName || `${actor || "好友"}的小狗`).slice(0, 18),
     petKind: String(petKind || "cockapoo").slice(0, 24),
     clientKind: String(clientKind || "desktop").slice(0, 18),
-    manualOnline: booleanValue(manualOnline, previous?.manualOnline || false),
     at: now,
   });
 }
@@ -123,7 +114,6 @@ function presenceFor(source) {
       petName: item.petName,
       petKind: item.petKind,
       clientKind: item.clientKind,
-      manualOnline: Boolean(item.manualOnline),
       lastSeenAgo: now - item.at,
     }));
   const lastEventAt = events.reduce((latest, item) => Math.max(latest, Number(item.at || 0)), 0);
@@ -150,9 +140,6 @@ function addEvent(event) {
     petName: event.petName || `${event.actor || "好友"}的小狗`,
     petKind: event.petKind || "cockapoo",
     source: event.source || "web",
-    targetSource: event.targetSource || "",
-    targetActor: event.targetActor || "",
-    targetPetName: event.targetPetName || "",
     label: ACTION_LABELS[event.action] || event.action,
     text: event.text || "",
     readBy: [],
@@ -170,19 +157,7 @@ function addEvent(event) {
 function broadcast(item) {
   const data = `data: ${JSON.stringify(item)}\n\n`;
   for (const stream of streams) {
-    if (item.kind === "read") {
-      if (stream.source === item.eventSource) {
-        stream.res.write(data);
-      }
-      continue;
-    }
-    if (item.source === stream.source) {
-      stream.res.write(data);
-      continue;
-    }
-    if (!item.targetSource || item.targetSource === stream.source) {
-      stream.res.write(data);
-    }
+    stream.write(data);
   }
 }
 
@@ -380,6 +355,20 @@ function pageHTML() {
         background: var(--gold);
       }
       .status[data-live="true"] .dot { background: var(--green); }
+      .presence-dot {
+        position: absolute;
+        right: 46px;
+        bottom: 102px;
+        width: 14px;
+        height: 14px;
+        border: 3px solid rgba(255,255,255,0.96);
+        border-radius: 50%;
+        background: #9ca3af;
+        box-shadow: 0 6px 16px rgba(43, 54, 72, 0.18);
+        z-index: 2;
+      }
+      .presence-dot[data-state="idle"] { background: var(--gold); }
+      .presence-dot[data-state="online"] { background: var(--green); }
       .pet-choice {
         display: grid;
         grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -394,19 +383,6 @@ function pageHTML() {
         border-color: rgba(255, 92, 145, 0.42);
         background: #fff1f6;
         color: #b91f52;
-      }
-      .online-list {
-        display: grid;
-        gap: 6px;
-        margin: 0 0 14px;
-        padding: 10px 12px;
-        border: 1px solid var(--line);
-        border-radius: 10px;
-        background: rgba(255,255,255,0.74);
-        color: var(--muted);
-        font-size: 13px;
-        font-weight: 800;
-        line-height: 1.35;
       }
       input {
         flex: 1;
@@ -595,6 +571,7 @@ function pageHTML() {
         <div class="pet-stage">
           <div class="bubble" id="bubble">选择一只小狗开始联机。</div>
           <div class="dog" id="dog" data-action="idle" aria-label="桌宠"></div>
+          <span class="presence-dot" id="presence-dot" data-state="offline" aria-label="对方不在线"></span>
           <div class="hearts" id="hearts" aria-hidden="true"></div>
         </div>
       </section>
@@ -606,7 +583,6 @@ function pageHTML() {
           <button type="button" data-pet="cockapoo" aria-pressed="false">卷毛</button>
           <button type="button" data-pet="dachshund" aria-pressed="false">叶子</button>
         </div>
-        <div class="online-list" id="online-list">在线列表加载中</div>
         <div class="actions">
           <button type="button" data-action="pat">摸摸</button>
           <button type="button" data-action="feed">投喂</button>
@@ -630,7 +606,6 @@ function pageHTML() {
           <input id="dog-scale" type="range" min="70" max="135" value="100" aria-label="狗狗大小">
         </div>
         <div class="log-tools">
-          <button type="button" id="manual-online">标记上线</button>
           <button type="button" id="read-all">已读全部</button>
           <button type="button" id="clear-log">清除显示</button>
         </div>
@@ -657,8 +632,7 @@ function pageHTML() {
       const log = document.querySelector("#log");
       const status = document.querySelector("#status");
       const statusText = document.querySelector("#status-text");
-      const onlineList = document.querySelector("#online-list");
-      const manualOnlineButton = document.querySelector("#manual-online");
+      const presenceDot = document.querySelector("#presence-dot");
       const messageInput = document.querySelector("#message");
       const scaleInput = document.querySelector("#dog-scale");
       const foodPicker = document.querySelector("#food-picker");
@@ -673,7 +647,6 @@ function pageHTML() {
       let selectedPet = localStorage.getItem("juanmao-room-pet-kind") || "cockapoo";
       let idleInteractionMs = 30 * 60 * 1000;
       let lastInteractionAt = Number(localStorage.getItem("juanmao-room-last-interaction-at") || 0);
-      let manualOnline = localStorage.getItem("juanmao-room-manual-online") === "1";
       let presenceTimer = null;
 
       function isFriendActor() {
@@ -725,6 +698,8 @@ function pageHTML() {
         status.dataset.live = String(normalized === "online");
         status.dataset.state = normalized;
         statusText.textContent = text;
+        presenceDot.dataset.state = normalized;
+        presenceDot.setAttribute("aria-label", text);
       }
 
       function rememberInteraction(at = Date.now()) {
@@ -742,7 +717,6 @@ function pageHTML() {
           petName: petNameForActor(actor),
           petKind: selectedPet,
           clientKind: "web",
-          manualOnline,
         };
       }
 
@@ -759,14 +733,6 @@ function pageHTML() {
         } else {
           setPresence("对方不在线", "offline");
         }
-        const selfLine = "我：" + petNameForActor() + " · " + (manualOnline ? "已标记上线" : "未标记上线");
-        const peerLines = peers.map((peer) => {
-          const name = peer.petName || peer.actor || "对方";
-          const status = peer.manualOnline ? "已标记上线" : "未标记上线";
-          return name + "：" + status;
-        });
-        onlineList.textContent = [selfLine, ...(peerLines.length ? peerLines : ["还没看到其他狗狗。"])].join("\\n");
-        manualOnlineButton.textContent = manualOnline ? "标记下线" : "标记上线";
       }
 
       async function pingPresence() {
@@ -918,7 +884,6 @@ function pageHTML() {
             petName: petNameForActor(actor),
             petKind: selectedPet,
             text: eventText,
-            manualOnline,
             source
           })
         }).catch(() => {
@@ -949,7 +914,6 @@ function pageHTML() {
             petName: petNameForActor(actor),
             petKind: selectedPet,
             text,
-            manualOnline,
             source
           })
         }).catch(() => {
@@ -1006,7 +970,6 @@ function pageHTML() {
           actor: identity.actor,
           petName: identity.petName,
           petKind: identity.petKind,
-          manualOnline: manualOnline ? "1" : "0",
         });
         const stream = new EventSource("/api/stream?" + streamParams.toString());
         stream.onopen = () => {
@@ -1052,11 +1015,6 @@ function pageHTML() {
       document.querySelector("#send-message").addEventListener("click", sendMessage);
       document.querySelector("#read-all").addEventListener("click", markAllRead);
       document.querySelector("#clear-log").addEventListener("click", clearLog);
-      manualOnlineButton.addEventListener("click", () => {
-        manualOnline = !manualOnline;
-        localStorage.setItem("juanmao-room-manual-online", manualOnline ? "1" : "0");
-        pingPresence();
-      });
       messageInput.addEventListener("keydown", (event) => {
         if (event.key === "Enter" && !event.shiftKey) {
           event.preventDefault();
@@ -1139,13 +1097,8 @@ async function handle(req, res) {
       petName: url.searchParams.get("petName") || "好友的小狗",
       petKind: url.searchParams.get("petKind") || "cockapoo",
       clientKind: "desktop",
-      manualOnline: url.searchParams.get("manualOnline"),
     });
-    const items = events.filter((event) =>
-      event.id > since
-      && event.source !== client
-      && (!event.targetSource || event.targetSource === client)
-    );
+    const items = events.filter((event) => event.id > since && event.source !== client);
     const readItems = receipts.filter((receipt) => receipt.id > sinceReceipt && receipt.eventSource === client);
     send(res, 200, { ok: true, events: items, receipts: readItems, presence: presenceFor(client) });
     return;
@@ -1170,14 +1123,12 @@ async function handle(req, res) {
       petName: url.searchParams.get("petName") || "好友的小狗",
       petKind: url.searchParams.get("petKind") || "cockapoo",
       clientKind: "web",
-      manualOnline: url.searchParams.get("manualOnline"),
     };
     touchPresence(presenceItem);
     const presenceTimer = source ? setInterval(() => touchPresence(presenceItem), 5_000) : null;
-    const stream = { res, source };
-    streams.add(stream);
+    streams.add(res);
     req.on("close", () => {
-      streams.delete(stream);
+      streams.delete(res);
       if (presenceTimer) clearInterval(presenceTimer);
       if (source) presence.delete(source);
     });
@@ -1214,7 +1165,6 @@ async function handle(req, res) {
       petName: payload.petName,
       petKind: payload.petKind,
       clientKind: payload.clientKind || "web",
-      manualOnline: payload.manualOnline,
     });
     send(res, 200, { ok: true, presence: presenceFor(source) });
     return;
@@ -1249,7 +1199,6 @@ async function handle(req, res) {
       petName: payload.petName,
       petKind: payload.petKind,
       clientKind: "desktop",
-      manualOnline: payload.manualOnline,
     });
     const event = addEvent({
       action,
@@ -1257,9 +1206,6 @@ async function handle(req, res) {
       petName: String(payload.petName || `${payload.actor || "好友"}的小狗`).slice(0, 18),
       petKind: String(payload.petKind || "cockapoo").slice(0, 24),
       source: String(payload.source || "web").slice(0, 80),
-      targetSource: String(payload.targetSource || "").slice(0, 80),
-      targetActor: String(payload.targetActor || "").slice(0, 18),
-      targetPetName: String(payload.targetPetName || "").slice(0, 18),
       text,
     });
     send(res, 200, { ok: true, event });
